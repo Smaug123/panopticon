@@ -1,0 +1,101 @@
+use std::sync::Arc;
+
+use anyhow::Result;
+use tokio::sync::broadcast;
+use tracing_subscriber::EnvFilter;
+
+use panopticon_server::config::{AppConfig, LlmProviderConfig};
+use panopticon_server::github::fetch::GitHubFetcher;
+use panopticon_server::llm::openai::OpenAiProvider;
+use panopticon_server::llm::provider::LlmProvider;
+use panopticon_server::scheduler::runner::JobRunner;
+use panopticon_server::{api, AppState};
+
+#[tokio::main]
+async fn main() -> Result<()> {
+    // Initialize logging
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| EnvFilter::new("panopticon_server=debug,info")),
+        )
+        .init();
+
+    // Load configuration
+    let config = AppConfig::load().map_err(|e| anyhow::anyhow!("Failed to load config: {}", e))?;
+    tracing::info!("Configuration loaded");
+
+    let config = Arc::new(config);
+
+    // Initialize database
+    let db_url = format!("sqlite:{}?mode=rwc", config.database.path.display());
+    tracing::info!("Connecting to database: {}", db_url);
+
+    let db = sqlx::sqlite::SqlitePoolOptions::new()
+        .max_connections(5)
+        .connect(&db_url)
+        .await?;
+
+    // Run migrations
+    tracing::info!("Running database migrations");
+    sqlx::migrate!("./migrations").run(&db).await?;
+
+    // Initialize LLM provider
+    let llm: Arc<dyn LlmProvider> = match &config.llm.provider {
+        LlmProviderConfig::OpenAi {
+            api_key,
+            model,
+            base_url,
+            reasoning_effort,
+        } => Arc::new(OpenAiProvider::new(
+            api_key.clone(),
+            model.clone(),
+            base_url.clone(),
+            reasoning_effort.clone(),
+        )),
+    };
+    tracing::info!("LLM provider initialized: {}", llm.name());
+
+    // Initialize GitHub fetcher
+    let github = Arc::new(GitHubFetcher::new(config.github.repos_dir.clone()));
+
+    // Create broadcast channel for review updates (buffer 100 messages)
+    let (review_updates, _) = broadcast::channel(100);
+
+    let state = AppState {
+        db: db.clone(),
+        config: config.clone(),
+        llm,
+        github,
+        review_updates,
+    };
+
+    // Spawn background job runner
+    let runner_state = state.clone();
+    let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
+
+    tokio::spawn(async move {
+        let runner = JobRunner::new(runner_state);
+        runner.run(shutdown_rx).await;
+    });
+
+    // Create router
+    let app = api::routes::create_router(state);
+
+    // Start server
+    let addr = format!("{}:{}", config.server.host, config.server.port);
+    tracing::info!("Starting server on {}", addr);
+
+    let listener = tokio::net::TcpListener::bind(&addr).await?;
+
+    axum::serve(listener, app)
+        .with_graceful_shutdown(async move {
+            tokio::signal::ctrl_c().await.ok();
+            tracing::info!("Shutdown signal received, stopping...");
+            shutdown_tx.send(true).ok();
+        })
+        .await?;
+
+    tracing::info!("Server stopped");
+    Ok(())
+}

@@ -1,0 +1,26 @@
+# Panopticon Configuration Example
+# Copy this to config.toml and fill in your values
+
+[server]
+host = "127.0.0.1"
+port = 3000
+
+[database]
+path = "./panopticon.db"
+
+[llm.provider]
+type = "openai"
+api_key = "sk-..."  # Or set PANOPTICON_LLM_PROVIDER_API_KEY env var
+model = "gpt-5.2-2025-12-11"
+# base_url = "https://api.openai.com/v1"  # Optional, for API-compatible providers
+reasoning_effort = "high"  # Options: "low", "medium", "high"
+
+[github]
+repos_dir = "./repos"
+
+[auth]
+api_key = "your-secret-api-key"  # Or set PANOPTICON_AUTH_API_KEY env var
+
+[scheduler]
+poll_interval_secs = 60
+review_interval_hours = 24
