@@ -1,4 +1,5 @@
 use sqlx::SqlitePool;
+use std::str::FromStr;
 
 use crate::domain::ids::{PromptId, RepoId, ReviewId};
 use crate::domain::repo::CommitSha;
@@ -95,7 +96,7 @@ impl TryFrom<(ReviewRow, Vec<ReviewResultRow>)> for Review {
 
     fn try_from((row, results): (ReviewRow, Vec<ReviewResultRow>)) -> Result<Self, Self::Error> {
         let commit_sha = CommitSha::parse(&row.commit_sha).ok_or("invalid commit SHA")?;
-        let trigger = ReviewTrigger::from_str(&row.trigger).ok_or("invalid trigger")?;
+        let trigger = ReviewTrigger::from_str(&row.trigger).map_err(|_| "invalid trigger")?;
         let status = parse_status(&row)?;
         let created_at = parse_datetime(&row.created_at)?;
 

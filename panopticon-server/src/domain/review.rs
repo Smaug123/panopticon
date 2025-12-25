@@ -1,6 +1,7 @@
 use crate::domain::ids::{PromptId, RepoId, ReviewId};
 use crate::domain::repo::CommitSha;
 use crate::domain::untrusted::UntrustedString;
+use std::str::FromStr;
 
 /// How the review was triggered - discriminated union, no invalid combinations.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -19,12 +20,16 @@ impl ReviewTrigger {
             ReviewTrigger::Manual => "manual",
         }
     }
+}
 
-    pub fn from_str(s: &str) -> Option<Self> {
+impl FromStr for ReviewTrigger {
+    type Err = ();
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s {
-            "scheduled" => Some(ReviewTrigger::Scheduled),
-            "manual" => Some(ReviewTrigger::Manual),
-            _ => None,
+            "scheduled" => Ok(ReviewTrigger::Scheduled),
+            "manual" => Ok(ReviewTrigger::Manual),
+            _ => Err(()),
         }
     }
 }
@@ -111,8 +116,8 @@ mod tests {
     fn review_trigger_roundtrips() {
         for trigger in [ReviewTrigger::Scheduled, ReviewTrigger::Manual] {
             let s = trigger.as_str();
-            let parsed = ReviewTrigger::from_str(s);
-            assert_eq!(parsed, Some(trigger));
+            let parsed: ReviewTrigger = s.parse().unwrap();
+            assert_eq!(parsed, trigger);
         }
     }
 

@@ -40,13 +40,6 @@ impl OpenAiProvider {
     }
 }
 
-/// Input message for the Responses API.
-#[derive(Serialize)]
-struct ResponsesInputMessage {
-    role: String,
-    content: String,
-}
-
 /// Reasoning configuration for the Responses API.
 #[derive(Serialize)]
 struct ReasoningConfig {
@@ -74,7 +67,9 @@ struct TextFormatType {
 struct ResponsesRequest {
     model: String,
     instructions: String,
-    input: Vec<ResponsesInputMessage>,
+    /// The user's input. For the Responses API, this can be a simple string
+    /// when there's only one user message, which is our use case.
+    input: String,
     reasoning: ReasoningConfig,
     text: TextFormat,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -118,19 +113,17 @@ impl LlmProvider for OpenAiProvider {
         request: LlmRequest,
     ) -> Pin<Box<dyn Stream<Item = Result<StreamChunk, LlmError>> + Send + '_>> {
         Box::pin(stream! {
-            let input = vec![ResponsesInputMessage {
-                role: "user".to_string(),
-                content: request.user_prompt,
-            }];
-
             // Parse the schema for structured output
             let schema: serde_json::Value = serde_json::from_str(REVIEW_OUTPUT_SCHEMA)
                 .expect("Invalid review output schema");
 
+            // Use the user prompt directly as a string input.
+            // The Responses API accepts either a string or an array of input items.
+            // Since we have a single user message, a string is simpler and correct.
             let body = ResponsesRequest {
                 model: self.model.clone(),
                 instructions: request.system_prompt,
-                input,
+                input: request.user_prompt,
                 reasoning: ReasoningConfig {
                     effort: self.reasoning_effort.clone(),
                 },
@@ -273,5 +266,48 @@ mod tests {
             "high".to_string(),
         );
         assert!(provider.max_context_tokens() >= 100_000);
+    }
+
+    #[test]
+    fn responses_api_request_uses_string_input() {
+        // Verify the request format is correct for the Responses API.
+        // The input field should be a simple string, not an array of messages.
+        let schema: serde_json::Value =
+            serde_json::from_str(REVIEW_OUTPUT_SCHEMA).expect("Valid schema");
+
+        let request = ResponsesRequest {
+            model: "gpt-5.2".to_string(),
+            instructions: "You are a helpful assistant".to_string(),
+            input: "Hello, how are you?".to_string(),
+            reasoning: ReasoningConfig {
+                effort: "high".to_string(),
+            },
+            text: TextFormat {
+                format: TextFormatType {
+                    format_type: "json_schema".to_string(),
+                    schema,
+                    name: "review_output".to_string(),
+                    strict: true,
+                },
+            },
+            max_output_tokens: Some(1000),
+            stream: true,
+        };
+
+        let json = serde_json::to_value(&request).expect("Should serialize");
+
+        // Verify input is a string, not an array
+        assert!(
+            json["input"].is_string(),
+            "input should be a string, got: {}",
+            json["input"]
+        );
+        assert_eq!(json["input"], "Hello, how are you?");
+
+        // Verify other required fields are present
+        assert_eq!(json["model"], "gpt-5.2");
+        assert_eq!(json["instructions"], "You are a helpful assistant");
+        assert_eq!(json["reasoning"]["effort"], "high");
+        assert_eq!(json["stream"], true);
     }
 }

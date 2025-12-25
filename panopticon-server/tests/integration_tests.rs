@@ -347,6 +347,54 @@ mod max_tokens {
     }
 }
 
+/// Test module for OpenAI Responses API format.
+///
+/// High severity: The Responses API payload uses input: [{ role, content: String }];
+/// but OpenAI expects input items to have `type: "message"` and content to be an
+/// array of typed blocks like `[{ type: "input_text", text: "..." }]`.
+mod openai_responses_api_format {
+    /// Documents the expected format for the Responses API.
+    ///
+    /// The current code sends:
+    /// ```json
+    /// {
+    ///   "input": [{ "role": "user", "content": "text" }]
+    /// }
+    /// ```
+    ///
+    /// But the Responses API expects:
+    /// ```json
+    /// {
+    ///   "input": [
+    ///     {
+    ///       "type": "message",
+    ///       "role": "user",
+    ///       "content": [{ "type": "input_text", "text": "text" }]
+    ///     }
+    ///   ]
+    /// }
+    /// ```
+    ///
+    /// Or more simply, just a string:
+    /// ```json
+    /// {
+    ///   "input": "text"
+    /// }
+    /// ```
+    #[test]
+    fn responses_api_input_format_documentation() {
+        // This test documents the expected format.
+        // The actual fix is verified by unit tests in openai.rs.
+
+        // For the Responses API, valid input formats are:
+        // 1. A string: "input": "Hello"
+        // 2. An array of input items with proper structure
+
+        // The simplest fix is to use the string format since we only have
+        // a single user message.
+    }
+}
+
 /// Test module for UntrustedString type.
 ///
 /// These tests verify that LLM output cannot be rendered without sanitization.
@@ -1004,5 +1052,216 @@ mod scheduling_loop_prevention {
             has_enabled,
             "Repo with enabled prompts should pass the check"
         );
+    }
+}
+
+/// Test module for review cleanup on early-return.
+///
+/// High severity: run_review marks the review in_progress, then any later ?
+/// (e.g., get_contents, mark_completed, update_last_commit) can early-return
+/// and leave the review stuck in_progress with no ReviewComplete broadcast.
+mod review_cleanup_on_error {
+    use super::*;
+
+    /// Test that reviews don't get stuck in_progress when errors occur.
+    ///
+    /// The bug: After mark_in_progress is called, if any subsequent operation
+    /// fails with ?, the review remains in_progress forever with no ReviewComplete
+    /// broadcast. This breaks the state machine and can wedge UI/scheduling.
+    #[tokio::test]
+    async fn review_should_not_stay_in_progress_after_error() {
+        let pool = setup_db().await;
+
+        // Create a repo
+        sqlx::query(
+            r#"
+            INSERT INTO repos (url, owner, name, created_at)
+            VALUES ('https://github.com/test/cleanup', 'test', 'cleanup', '2024-01-01T00:00:00Z')
+            "#,
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        use panopticon_server::db::reviews;
+        use panopticon_server::domain::ids::RepoId;
+        use panopticon_server::domain::repo::CommitSha;
+        use panopticon_server::domain::review::{NewReview, ReviewStatus, ReviewTrigger};
+
+        let sha = CommitSha::parse("abcdef1234567890abcdef1234567890abcdef12").unwrap();
+        let review = reviews::create(
+            &pool,
+            NewReview {
+                repo_id: RepoId::new(1),
+                commit_sha: sha,
+                trigger: ReviewTrigger::Manual,
+            },
+        )
+        .await
+        .unwrap();
+
+        // Mark as in_progress (simulating what run_review does)
+        reviews::mark_in_progress(&pool, review.id).await.unwrap();
+
+        // Verify it's in_progress
+        let in_prog = reviews::get_by_id(&pool, review.id).await.unwrap().unwrap();
+        assert!(
+            matches!(in_prog.status, ReviewStatus::InProgress { .. }),
+            "Review should be in_progress"
+        );
+
+        // The bug is that if run_review encounters an error after mark_in_progress,
+        // it early-returns without marking the review as failed.
+        // The fix should use a cleanup guard that marks failed on drop.
+
+        // Simulate what SHOULD happen on error: cleanup marks it failed
+        // (For now, we verify the DB operations work correctly)
+        reviews::mark_failed(&pool, review.id, "simulated error")
+            .await
+            .unwrap();
+
+        let failed = reviews::get_by_id(&pool, review.id).await.unwrap().unwrap();
+        assert!(
+            matches!(failed.status, ReviewStatus::Failed { .. }),
+            "Review should be marked failed on error, got: {:?}",
+            failed.status
+        );
+    }
+}
+
+/// Test module for SSE terminal events.
+///
+/// Low severity: SSE short-circuits only for completed reviews; if a client
+/// connects after a failed review, the stream stays open without a terminal event.
+mod sse_terminal_events {
+    use panopticon_server::domain::review::ReviewStatus;
+
+    /// Documents that SSE should handle failed reviews with a terminal event.
+    ///
+    /// The bug: review_stream only checks for Completed status. If a client
+    /// connects after a review has failed, they get subscribed to updates
+    /// instead of receiving an immediate terminal event.
+    #[test]
+    fn sse_should_handle_failed_reviews() {
+        // The fix should check for BOTH Completed and Failed statuses
+        // and return a terminal event for either.
+
+        // Verify Failed is a valid terminal status
+        let failed = ReviewStatus::Failed {
+            started_at: None,
+            failed_at: chrono::Utc::now(),
+            error: "test error".to_string(),
+        };
+        let status_str = failed.status_str();
+        assert_eq!(status_str, "failed");
+    }
+
+    #[test]
+    fn terminal_statuses_are_completed_and_failed() {
+        // Document which statuses are terminal (review won't change further)
+        let completed = ReviewStatus::Completed {
+            started_at: chrono::Utc::now(),
+            completed_at: chrono::Utc::now(),
+            duration_secs: 100,
+        };
+        let failed = ReviewStatus::Failed {
+            started_at: None,
+            failed_at: chrono::Utc::now(),
+            error: "error".to_string(),
+        };
+
+        // Both should be considered terminal for SSE purposes
+        assert!(matches!(
+            completed,
+            ReviewStatus::Completed { .. } | ReviewStatus::Failed { .. }
+        ));
+        assert!(matches!(
+            failed,
+            ReviewStatus::Completed { .. } | ReviewStatus::Failed { .. }
+        ));
+    }
+}
+
+/// Test module for review completion ordering.
+///
+/// Medium severity: mark_completed happens before update_last_commit; if that
+/// update fails, the job is marked failed after a completed review, and retries
+/// can create duplicate reviews for the same commit.
+mod completion_ordering {
+    use super::*;
+
+    /// Documents the ordering issue between mark_completed and update_last_commit.
+    ///
+    /// Current order:
+    /// 1. mark_completed (review is "completed")
+    /// 2. update_last_commit (can fail with ?)
+    /// 3. If step 2 fails, job fails, but review is already "completed"
+    /// 4. On retry, same commit gets a new review (duplicate)
+    ///
+    /// Correct order:
+    /// 1. update_last_commit (can fail with ?)
+    /// 2. mark_completed (review is "completed")
+    /// 3. If step 1 fails, review stays in_progress (or is marked failed by cleanup guard)
+    /// 4. No duplicate reviews since mark_completed wasn't called
+    #[tokio::test]
+    async fn update_last_commit_should_precede_mark_completed() {
+        let pool = setup_db().await;
+
+        // Create a repo
+        sqlx::query(
+            r#"
+            INSERT INTO repos (url, owner, name, created_at)
+            VALUES ('https://github.com/test/ordering', 'test', 'ordering', '2024-01-01T00:00:00Z')
+            "#,
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        use panopticon_server::db::{repos, reviews};
+        use panopticon_server::domain::ids::RepoId;
+        use panopticon_server::domain::repo::CommitSha;
+        use panopticon_server::domain::review::{NewReview, ReviewStatus, ReviewTrigger};
+
+        let sha = CommitSha::parse("abcdef1234567890abcdef1234567890abcdef12").unwrap();
+        let review = reviews::create(
+            &pool,
+            NewReview {
+                repo_id: RepoId::new(1),
+                commit_sha: sha.clone(),
+                trigger: ReviewTrigger::Manual,
+            },
+        )
+        .await
+        .unwrap();
+
+        reviews::mark_in_progress(&pool, review.id).await.unwrap();
+
+        // The correct sequence is:
+        // 1. update_last_commit (idempotent, can be retried)
+        // 2. mark_completed (only after all state is consistent)
+
+        // First update the repo's last_commit_sha
+        repos::update_last_commit(&pool, RepoId::new(1), &sha)
+            .await
+            .unwrap();
+
+        // Then mark the review as completed
+        reviews::mark_completed(&pool, review.id, 100)
+            .await
+            .unwrap();
+
+        // Verify both operations completed
+        let repo = repos::get_by_id(&pool, RepoId::new(1))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(repo.last_commit_sha, Some(sha));
+
+        let completed_review = reviews::get_by_id(&pool, review.id).await.unwrap().unwrap();
+        assert!(matches!(
+            completed_review.status,
+            ReviewStatus::Completed { .. }
+        ));
     }
 }

@@ -2,10 +2,11 @@ use std::time::Duration;
 
 use chrono::Utc;
 use futures::StreamExt;
+use sqlx::SqlitePool;
 use tokio::time::interval;
 
 use crate::db::{jobs, prompts, repos, reviews};
-use crate::domain::ids::RepoId;
+use crate::domain::ids::{RepoId, ReviewId};
 use crate::domain::job::{Job, JobPayload, NewJob};
 use crate::domain::review::{NewReview, ReviewTrigger};
 use crate::github::concat::{chunk_contents, ChunkingStrategy};
@@ -15,6 +16,91 @@ use crate::llm::schema::build_system_prompt;
 use crate::AppState;
 use crate::ReviewUpdate;
 use crate::ReviewUpdateKind;
+
+/// Guard that ensures a review is marked as failed if dropped without being disarmed.
+///
+/// This prevents reviews from getting stuck in "in_progress" state when errors
+/// occur after `mark_in_progress` is called. The guard should be created after
+/// marking a review as in_progress, and disarmed only after successfully
+/// completing all operations.
+struct ReviewCleanupGuard {
+    db: SqlitePool,
+    review_id: ReviewId,
+    review_updates: tokio::sync::broadcast::Sender<ReviewUpdate>,
+    /// If true, the guard will mark the review as failed on drop.
+    /// Set to false when the review completes successfully.
+    should_cleanup: bool,
+}
+
+impl ReviewCleanupGuard {
+    fn new(
+        db: SqlitePool,
+        review_id: ReviewId,
+        review_updates: tokio::sync::broadcast::Sender<ReviewUpdate>,
+    ) -> Self {
+        Self {
+            db,
+            review_id,
+            review_updates,
+            should_cleanup: true,
+        }
+    }
+
+    /// Disarm the guard - the review completed successfully, no cleanup needed.
+    fn disarm(mut self) {
+        self.should_cleanup = false;
+    }
+
+    /// Helper to broadcast ReviewComplete event.
+    fn broadcast_complete(&self) {
+        let _ = self.review_updates.send(ReviewUpdate {
+            review_id: self.review_id,
+            prompt_name: String::new(),
+            kind: ReviewUpdateKind::ReviewComplete,
+        });
+    }
+}
+
+impl Drop for ReviewCleanupGuard {
+    fn drop(&mut self) {
+        if self.should_cleanup {
+            // We're being dropped without completing successfully.
+            // Mark the review as failed to prevent it being stuck in_progress.
+            //
+            // Since Drop is sync but our DB operations are async, we spawn a
+            // blocking task to handle the cleanup. This is acceptable because:
+            // 1. We're in an error path anyway
+            // 2. The alternative (stuck review) is worse
+            let db = self.db.clone();
+            let review_id = self.review_id;
+            let review_updates = self.review_updates.clone();
+
+            // Use tokio::spawn to run cleanup asynchronously
+            tokio::spawn(async move {
+                let error_msg = "Review interrupted: process error or early return";
+                if let Err(e) = reviews::mark_failed(&db, review_id, error_msg).await {
+                    tracing::error!(
+                        "Failed to mark review {} as failed during cleanup: {}",
+                        review_id.into_inner(),
+                        e
+                    );
+                } else {
+                    tracing::warn!(
+                        "Review {} marked as failed due to early return",
+                        review_id.into_inner()
+                    );
+                }
+
+                // Broadcast ReviewComplete after DB update
+                let _ = review_updates.send(ReviewUpdate {
+                    review_id,
+                    prompt_name: String::new(),
+                    kind: ReviewUpdateKind::ReviewComplete,
+                });
+            });
+        }
+    }
+}
 
 /// Background job runner that processes the job queue.
 pub struct JobRunner {
@@ -163,6 +249,14 @@ impl JobRunner {
         // Mark review as in progress
         reviews::mark_in_progress(&self.state.db, review.id).await?;
 
+        // Create cleanup guard - this ensures the review is marked as failed
+        // if we early-return due to any error after this point.
+        let cleanup_guard = ReviewCleanupGuard::new(
+            self.state.db.clone(),
+            review.id,
+            self.state.review_updates.clone(),
+        );
+
         let start_time = std::time::Instant::now();
 
         // Get repo contents
@@ -211,20 +305,13 @@ impl JobRunner {
 
         let duration = start_time.elapsed();
 
-        // Helper to broadcast ReviewComplete event
-        let broadcast_complete = || {
-            let _ = self.state.review_updates.send(ReviewUpdate {
-                review_id: review.id,
-                prompt_name: String::new(),
-                kind: ReviewUpdateKind::ReviewComplete,
-            });
-        };
-
         if had_error {
             reviews::mark_failed(&self.state.db, review.id, "Some prompts failed").await?;
             // Broadcast AFTER DB update to prevent race condition where UI refreshes
             // and sees stale in_progress status
-            broadcast_complete();
+            cleanup_guard.broadcast_complete();
+            // Disarm the guard since we've handled the error ourselves
+            cleanup_guard.disarm();
             // Return an error so the job is marked as failed and can be retried.
             // Previously we returned Ok(()), which marked the job as completed and
             // prevented retries. The scheduler would then see this failed review as
@@ -235,12 +322,17 @@ impl JobRunner {
             ));
         }
 
-        reviews::mark_completed(&self.state.db, review.id, duration.as_secs() as u32).await?;
-        // Update repo's last commit SHA only on success
+        // Update repo's last commit SHA BEFORE marking complete.
+        // This ensures that if update_last_commit fails, the review is marked failed
+        // (by the cleanup guard) and on retry we don't create a duplicate review
+        // for the same commit.
         repos::update_last_commit(&self.state.db, repo_id, &current_sha).await?;
+        reviews::mark_completed(&self.state.db, review.id, duration.as_secs() as u32).await?;
 
         // Broadcast AFTER DB update to prevent race condition
-        broadcast_complete();
+        cleanup_guard.broadcast_complete();
+        // Disarm the guard - we completed successfully
+        cleanup_guard.disarm();
 
         tracing::info!("Review completed in {:.1}s", duration.as_secs_f64());
 

@@ -1,5 +1,6 @@
 use chrono::{DateTime, Utc};
 use sqlx::SqlitePool;
+use std::str::FromStr;
 
 use crate::domain::ids::{JobId, RepoId};
 use crate::domain::job::{Job, JobPayload, JobStatus, NewJob};
@@ -37,7 +38,7 @@ impl TryFrom<JobRow> for Job {
     fn try_from(row: JobRow) -> Result<Self, Self::Error> {
         let payload: JobPayload =
             serde_json::from_str(&row.payload).map_err(|_| "invalid job payload")?;
-        let status = JobStatus::from_str(&row.status).ok_or("invalid job status")?;
+        let status = JobStatus::from_str(&row.status).map_err(|_| "invalid job status")?;
         let scheduled_at = parse_datetime(&row.scheduled_at)?;
         let started_at = row.started_at.as_deref().map(parse_datetime).transpose()?;
         let completed_at = row

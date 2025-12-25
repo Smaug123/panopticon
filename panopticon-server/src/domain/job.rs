@@ -1,5 +1,6 @@
 use crate::domain::ids::{JobId, RepoId};
 use chrono::{DateTime, Utc};
+use std::str::FromStr;
 
 /// Job payload types - extensible but type-safe.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -31,14 +32,18 @@ impl JobStatus {
             JobStatus::Failed => "failed",
         }
     }
+}
 
-    pub fn from_str(s: &str) -> Option<Self> {
+impl FromStr for JobStatus {
+    type Err = ();
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s {
-            "pending" => Some(JobStatus::Pending),
-            "running" => Some(JobStatus::Running),
-            "completed" => Some(JobStatus::Completed),
-            "failed" => Some(JobStatus::Failed),
-            _ => None,
+            "pending" => Ok(JobStatus::Pending),
+            "running" => Ok(JobStatus::Running),
+            "completed" => Ok(JobStatus::Completed),
+            "failed" => Ok(JobStatus::Failed),
+            _ => Err(()),
         }
     }
 }
@@ -125,8 +130,8 @@ mod tests {
             JobStatus::Failed,
         ] {
             let s = status.as_str();
-            let parsed = JobStatus::from_str(s);
-            assert_eq!(parsed, Some(status));
+            let parsed: JobStatus = s.parse().unwrap();
+            assert_eq!(parsed, status);
         }
     }
 }

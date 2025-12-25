@@ -29,21 +29,42 @@ pub async fn review_stream(
         .await?
         .ok_or_else(|| ApiError::NotFound("Review not found".to_string()))?;
 
-    // If review is already completed, send the results immediately
-    if matches!(review.status, ReviewStatus::Completed { .. }) {
-        let stream: SseStream = Box::pin(futures::stream::once(async move {
-            let data = serde_json::json!({
-                "type": "complete",
-                "results": review.results,
-            });
-            Ok::<_, Infallible>(Event::default().data(data.to_string()))
-        }));
+    // If review is already in a terminal state (completed or failed),
+    // send the results immediately instead of subscribing to updates.
+    match &review.status {
+        ReviewStatus::Completed { .. } => {
+            let stream: SseStream = Box::pin(futures::stream::once(async move {
+                let data = serde_json::json!({
+                    "type": "complete",
+                    "results": review.results,
+                });
+                Ok::<_, Infallible>(Event::default().data(data.to_string()))
+            }));
 
-        return Ok(Sse::new(stream).keep_alive(
-            axum::response::sse::KeepAlive::new()
-                .interval(Duration::from_secs(15))
-                .text("ping"),
-        ));
+            return Ok(Sse::new(stream).keep_alive(
+                axum::response::sse::KeepAlive::new()
+                    .interval(Duration::from_secs(15))
+                    .text("ping"),
+            ));
+        }
+        ReviewStatus::Failed { error, .. } => {
+            let error = error.clone();
+            let stream: SseStream = Box::pin(futures::stream::once(async move {
+                let data = serde_json::json!({
+                    "type": "failed",
+                    "error": error,
+                });
+                Ok::<_, Infallible>(Event::default().data(data.to_string()))
+            }));
+
+            return Ok(Sse::new(stream).keep_alive(
+                axum::response::sse::KeepAlive::new()
+                    .interval(Duration::from_secs(15))
+                    .text("ping"),
+            ));
+        }
+        // Pending or InProgress - subscribe to updates below
+        ReviewStatus::Pending | ReviewStatus::InProgress { .. } => {}
     }
 
     // Subscribe to updates
