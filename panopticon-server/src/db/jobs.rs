@@ -230,3 +230,45 @@ pub async fn cleanup_old(pool: &SqlitePool, days: i64) -> Result<u64, sqlx::Erro
 
     Ok(result.rows_affected())
 }
+
+/// Reclaim jobs that have been stuck in 'running' state for too long.
+///
+/// This handles the case where a process crashes while a job is running.
+/// Jobs stuck for longer than `stuck_minutes` are either:
+/// - Reset to 'pending' if attempts < max_attempts (for retry)
+/// - Marked as 'failed' if attempts >= max_attempts
+///
+/// Returns the number of jobs reclaimed.
+pub async fn reclaim_stuck(pool: &SqlitePool, stuck_minutes: i64) -> Result<u64, sqlx::Error> {
+    let cutoff = (Utc::now() - chrono::Duration::minutes(stuck_minutes)).to_rfc3339();
+    let now = Utc::now().to_rfc3339();
+
+    // Update stuck running jobs:
+    // - If attempts < max_attempts: set back to pending for retry
+    // - If attempts >= max_attempts: mark as failed
+    let result = sqlx::query(
+        r#"
+        UPDATE jobs
+        SET status = CASE
+                WHEN attempts < max_attempts THEN 'pending'
+                ELSE 'failed'
+            END,
+            last_error = CASE
+                WHEN attempts < max_attempts THEN 'Job reclaimed after stuck in running state'
+                ELSE 'Job failed after exceeding max attempts while stuck'
+            END,
+            completed_at = CASE
+                WHEN attempts >= max_attempts THEN ?
+                ELSE NULL
+            END
+        WHERE status = 'running'
+          AND started_at < ?
+        "#,
+    )
+    .bind(&now)
+    .bind(&cutoff)
+    .execute(pool)
+    .await?;
+
+    Ok(result.rows_affected())
+}

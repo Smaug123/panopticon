@@ -207,3 +207,15 @@ pub async fn count_by_repo(pool: &SqlitePool, repo_id: RepoId) -> Result<i64, sq
 
     Ok(count)
 }
+
+/// Check if a repository has any enabled prompts.
+/// Used by the scheduler to avoid scheduling reviews for repos with no reviewable prompts.
+pub async fn has_enabled_prompts(pool: &SqlitePool, repo_id: RepoId) -> Result<bool, sqlx::Error> {
+    let count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM prompts WHERE repo_id = ? AND enabled = 1")
+            .bind(repo_id.into_inner())
+            .fetch_one(pool)
+            .await?;
+
+    Ok(count > 0)
+}

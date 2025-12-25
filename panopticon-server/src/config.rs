@@ -119,6 +119,10 @@ pub struct SchedulerConfig {
     pub poll_interval_secs: u64,
     #[serde(default = "default_review_interval")]
     pub review_interval_hours: u64,
+    /// Jobs running longer than this are considered stuck and will be reclaimed.
+    /// This handles process crashes leaving jobs in 'running' state.
+    #[serde(default = "default_job_timeout")]
+    pub job_timeout_minutes: u64,
 }
 
 fn default_poll_interval() -> u64 {
@@ -129,11 +133,16 @@ fn default_review_interval() -> u64 {
     24
 }
 
+fn default_job_timeout() -> u64 {
+    30 // 30 minutes default
+}
+
 impl Default for SchedulerConfig {
     fn default() -> Self {
         Self {
             poll_interval_secs: default_poll_interval(),
             review_interval_hours: default_review_interval(),
+            job_timeout_minutes: default_job_timeout(),
         }
     }
 }

@@ -24,6 +24,16 @@ impl GitHubRepoUrl {
     /// case-insensitive filesystems (macOS, Windows), having both
     /// could corrupt clones.
     pub fn parse(s: &str) -> Option<Self> {
+        // Reject URLs with double slashes in the path portion before parsing.
+        // The url crate normalizes paths, so we check the raw string.
+        // We look for "//" after "github.com" to avoid matching the scheme "https://"
+        if let Some(host_pos) = s.find("github.com") {
+            let after_host = &s[host_pos + "github.com".len()..];
+            if after_host.contains("//") {
+                return None;
+            }
+        }
+
         let url = Url::parse(s).ok()?;
 
         // Must be HTTPS
@@ -33,6 +43,11 @@ impl GitHubRepoUrl {
 
         // Must be github.com
         if url.host_str() != Some("github.com") {
+            return None;
+        }
+
+        // Reject query strings and fragments - we only accept clean repo URLs
+        if url.query().is_some() || url.fragment().is_some() {
             return None;
         }
 
@@ -200,6 +215,14 @@ mod tests {
             "https://github.com/owner/",
             "https://github.com/owner/repo/blob/main/file.rs",
             "ftp://github.com/owner/repo",
+            // Query strings and fragments should be rejected
+            "https://github.com/owner/repo?utm=1",
+            "https://github.com/owner/repo#readme",
+            "https://github.com/owner/repo?foo=bar#section",
+            // Extra slashes in path should be rejected
+            "https://github.com/owner/repo//blob",
+            "https://github.com/owner//repo",
+            "https://github.com//owner/repo",
         ];
 
         for url in invalid {

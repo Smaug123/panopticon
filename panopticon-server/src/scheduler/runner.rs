@@ -52,6 +52,18 @@ impl JobRunner {
     }
 
     async fn tick(&self) {
+        // Reclaim jobs stuck in 'running' state (e.g., from process crashes)
+        let timeout_minutes = self.state.config.scheduler.job_timeout_minutes as i64;
+        match jobs::reclaim_stuck(&self.state.db, timeout_minutes).await {
+            Ok(count) if count > 0 => {
+                tracing::warn!("Reclaimed {} stuck job(s)", count);
+            }
+            Err(e) => {
+                tracing::error!("Failed to reclaim stuck jobs: {}", e);
+            }
+            _ => {}
+        }
+
         // Process pending jobs
         self.process_pending_jobs().await;
 
@@ -174,7 +186,7 @@ impl JobRunner {
         for prompt in &prompts_list {
             tracing::info!("Running prompt: {}", prompt.name);
 
-            match self.run_prompt_review(review.id, &prompt, &chunks).await {
+            match self.run_prompt_review(review.id, prompt, &chunks).await {
                 Ok(output) => {
                     // Store result
                     if let Err(e) = reviews::add_result(
@@ -199,15 +211,20 @@ impl JobRunner {
 
         let duration = start_time.elapsed();
 
-        // Send review complete event to close SSE streams (do this before potential error return)
-        let _ = self.state.review_updates.send(ReviewUpdate {
-            review_id: review.id,
-            prompt_name: String::new(),
-            kind: ReviewUpdateKind::ReviewComplete,
-        });
+        // Helper to broadcast ReviewComplete event
+        let broadcast_complete = || {
+            let _ = self.state.review_updates.send(ReviewUpdate {
+                review_id: review.id,
+                prompt_name: String::new(),
+                kind: ReviewUpdateKind::ReviewComplete,
+            });
+        };
 
         if had_error {
             reviews::mark_failed(&self.state.db, review.id, "Some prompts failed").await?;
+            // Broadcast AFTER DB update to prevent race condition where UI refreshes
+            // and sees stale in_progress status
+            broadcast_complete();
             // Return an error so the job is marked as failed and can be retried.
             // Previously we returned Ok(()), which marked the job as completed and
             // prevented retries. The scheduler would then see this failed review as
@@ -221,6 +238,9 @@ impl JobRunner {
         reviews::mark_completed(&self.state.db, review.id, duration.as_secs() as u32).await?;
         // Update repo's last commit SHA only on success
         repos::update_last_commit(&self.state.db, repo_id, &current_sha).await?;
+
+        // Broadcast AFTER DB update to prevent race condition
+        broadcast_complete();
 
         tracing::info!("Review completed in {:.1}s", duration.as_secs_f64());
 
@@ -238,7 +258,7 @@ impl JobRunner {
         let system_prompt = build_system_prompt(prompt.text.as_str());
 
         // If single chunk, just run it
-        if chunks.len() == 1 {
+        let output = if chunks.len() == 1 {
             let request = LlmRequest {
                 system_prompt,
                 user_prompt: format!(
@@ -248,55 +268,63 @@ impl JobRunner {
                 max_tokens: 16_000,
             };
 
-            return self
-                .run_llm_streaming(review_id, &prompt.name, request)
-                .await;
-        }
+            self.run_llm_streaming(review_id, &prompt.name, request)
+                .await?
+        } else {
+            // Multiple chunks: review each and aggregate
+            let mut all_reasoning = Vec::new();
+            let mut any_action_required = false;
+            let mut all_comments = Vec::new();
 
-        // Multiple chunks: review each and aggregate
-        let mut all_reasoning = Vec::new();
-        let mut any_action_required = false;
-        let mut all_comments = Vec::new();
+            for (i, chunk) in chunks.iter().enumerate() {
+                let chunk_prompt = format!(
+                    "Please review part {} of {} of this codebase:\n\n{}",
+                    i + 1,
+                    chunks.len(),
+                    chunk.content
+                );
 
-        for (i, chunk) in chunks.iter().enumerate() {
-            let chunk_prompt = format!(
-                "Please review part {} of {} of this codebase:\n\n{}",
-                i + 1,
-                chunks.len(),
-                chunk.content
-            );
+                let request = LlmRequest {
+                    system_prompt: system_prompt.clone(),
+                    user_prompt: chunk_prompt,
+                    max_tokens: 8_000,
+                };
 
-            let request = LlmRequest {
-                system_prompt: system_prompt.clone(),
-                user_prompt: chunk_prompt,
-                max_tokens: 8_000,
-            };
+                let chunk_output = self
+                    .run_llm_streaming(review_id, &prompt.name, request)
+                    .await?;
 
-            let output = self
-                .run_llm_streaming(review_id, &prompt.name, request)
-                .await?;
+                // Use as_raw() to get the content for aggregation
+                all_reasoning.push(format!(
+                    "## Part {}\n{}",
+                    i + 1,
+                    chunk_output.detailed_reasoning.as_raw()
+                ));
+                any_action_required |= chunk_output.action_required;
+                all_comments.push(format!(
+                    "## Part {}\n{}",
+                    i + 1,
+                    chunk_output.user_visible_comments.as_raw()
+                ));
+            }
 
-            // Use as_raw() to get the content for aggregation
-            all_reasoning.push(format!(
-                "## Part {}\n{}",
-                i + 1,
-                output.detailed_reasoning.as_raw()
-            ));
-            any_action_required |= output.action_required;
-            all_comments.push(format!(
-                "## Part {}\n{}",
-                i + 1,
-                output.user_visible_comments.as_raw()
-            ));
-        }
+            // Combine results - wrap in UntrustedString since content is from LLM
+            use crate::domain::untrusted::UntrustedString;
+            ReviewOutput {
+                detailed_reasoning: UntrustedString::from(all_reasoning.join("\n\n")),
+                action_required: any_action_required,
+                user_visible_comments: UntrustedString::from(all_comments.join("\n\n")),
+            }
+        };
 
-        // Combine results - wrap in UntrustedString since content is from LLM
-        use crate::domain::untrusted::UntrustedString;
-        Ok(ReviewOutput {
-            detailed_reasoning: UntrustedString::from(all_reasoning.join("\n\n")),
-            action_required: any_action_required,
-            user_visible_comments: UntrustedString::from(all_comments.join("\n\n")),
-        })
+        // Send prompt complete event once per prompt (not per chunk)
+        let _ = self.state.review_updates.send(ReviewUpdate {
+            review_id,
+            prompt_name: prompt.name.clone(),
+            kind: ReviewUpdateKind::PromptComplete,
+        });
+
+        Ok(output)
     }
 
     async fn run_llm_streaming(
@@ -322,12 +350,9 @@ impl JobRunner {
             }
         }
 
-        // Send prompt complete event (the entire review may have more prompts)
-        let _ = self.state.review_updates.send(ReviewUpdate {
-            review_id,
-            prompt_name: prompt_name.to_string(),
-            kind: ReviewUpdateKind::PromptComplete,
-        });
+        // Note: PromptComplete is emitted by run_prompt_review after all chunks
+        // for a prompt are processed. This ensures multi-chunk prompts only emit
+        // PromptComplete once, not once per chunk.
 
         crate::llm::schema::parse_review_output(&full_text)
             .map_err(|e| anyhow::anyhow!("Failed to parse LLM response: {}", e))
@@ -347,6 +372,13 @@ impl JobRunner {
                 continue;
             }
 
+            // Check if repo has any enabled prompts - skip if not.
+            // This prevents a tight scheduling loop for repos where prompt creation
+            // failed or all prompts have been disabled.
+            if !prompts::has_enabled_prompts(&self.state.db, repo.id).await? {
+                continue;
+            }
+
             // Check last review time - only count COMPLETED reviews as "recent".
             // Failed reviews should not prevent scheduling a retry.
             let last_review = reviews::get_latest_for_repo(&self.state.db, repo.id).await?;
@@ -357,8 +389,10 @@ impl JobRunner {
                     // Only completed reviews count as "recent" for scheduling purposes.
                     // Failed or in-progress reviews should not block scheduling.
                     match review.status {
-                        ReviewStatus::Completed { .. } => {
-                            let hours_since = (Utc::now() - review.created_at).num_hours();
+                        ReviewStatus::Completed { completed_at, .. } => {
+                            // Use completed_at (not created_at) so long-running reviews
+                            // don't shorten the effective interval.
+                            let hours_since = (Utc::now() - completed_at).num_hours();
                             hours_since >= review_interval_hours
                         }
                         ReviewStatus::Failed { .. } => {
