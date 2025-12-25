@@ -199,20 +199,28 @@ impl JobRunner {
 
         let duration = start_time.elapsed();
 
-        if had_error {
-            reviews::mark_failed(&self.state.db, review.id, "Some prompts failed").await?;
-        } else {
-            reviews::mark_completed(&self.state.db, review.id, duration.as_secs() as u32).await?;
-            // Update repo's last commit SHA
-            repos::update_last_commit(&self.state.db, repo_id, &current_sha).await?;
-        }
-
-        // Send review complete event to close SSE streams
+        // Send review complete event to close SSE streams (do this before potential error return)
         let _ = self.state.review_updates.send(ReviewUpdate {
             review_id: review.id,
             prompt_name: String::new(),
             kind: ReviewUpdateKind::ReviewComplete,
         });
+
+        if had_error {
+            reviews::mark_failed(&self.state.db, review.id, "Some prompts failed").await?;
+            // Return an error so the job is marked as failed and can be retried.
+            // Previously we returned Ok(()), which marked the job as completed and
+            // prevented retries. The scheduler would then see this failed review as
+            // "recent" and not schedule a retry for review_interval_hours.
+            return Err(anyhow::anyhow!(
+                "Review failed: some prompts failed (see review {} for details)",
+                review.id.into_inner()
+            ));
+        }
+
+        reviews::mark_completed(&self.state.db, review.id, duration.as_secs() as u32).await?;
+        // Update repo's last commit SHA only on success
+        repos::update_last_commit(&self.state.db, repo_id, &current_sha).await?;
 
         tracing::info!("Review completed in {:.1}s", duration.as_secs_f64());
 
@@ -326,6 +334,8 @@ impl JobRunner {
     }
 
     async fn schedule_daily_reviews(&self) -> anyhow::Result<()> {
+        use crate::domain::review::ReviewStatus;
+
         let review_interval_hours = self.state.config.scheduler.review_interval_hours as i64;
 
         // Get all repos
@@ -337,14 +347,29 @@ impl JobRunner {
                 continue;
             }
 
-            // Check last review time
+            // Check last review time - only count COMPLETED reviews as "recent".
+            // Failed reviews should not prevent scheduling a retry.
             let last_review = reviews::get_latest_for_repo(&self.state.db, repo.id).await?;
 
             let should_schedule = match last_review {
                 None => true, // Never reviewed
                 Some(review) => {
-                    let hours_since = (Utc::now() - review.created_at).num_hours();
-                    hours_since >= review_interval_hours
+                    // Only completed reviews count as "recent" for scheduling purposes.
+                    // Failed or in-progress reviews should not block scheduling.
+                    match review.status {
+                        ReviewStatus::Completed { .. } => {
+                            let hours_since = (Utc::now() - review.created_at).num_hours();
+                            hours_since >= review_interval_hours
+                        }
+                        ReviewStatus::Failed { .. } => {
+                            // Failed review - allow immediate retry scheduling
+                            true
+                        }
+                        ReviewStatus::Pending | ReviewStatus::InProgress { .. } => {
+                            // Still running, don't schedule another
+                            false
+                        }
+                    }
                 }
             };
 

@@ -494,7 +494,8 @@ function renderReviewDetail() {
 }
 
 function startReviewStream(reviewId) {
-    const eventSource = new EventSource(`/api/reviews/${reviewId}/stream`);
+    // EventSource cannot send Authorization headers, so we pass the token as a query param
+    const eventSource = new EventSource(`/api/reviews/${reviewId}/stream?token=${encodeURIComponent(state.apiKey)}`);
     let currentPrompt = '';
     let content = {};
 

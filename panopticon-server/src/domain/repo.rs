@@ -3,9 +3,14 @@ use url::Url;
 
 /// A validated GitHub repository URL.
 /// Only constructible from valid github.com URLs - parse, don't validate.
+///
+/// Owner and name are normalized to lowercase to match GitHub's case-insensitive
+/// behavior and prevent filesystem collisions on case-insensitive systems.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GitHubRepoUrl {
+    /// Owner (normalized to lowercase)
     owner: String,
+    /// Repo name (normalized to lowercase)
     name: String,
     url: Url,
 }
@@ -13,6 +18,11 @@ pub struct GitHubRepoUrl {
 impl GitHubRepoUrl {
     /// Parse a URL string into a validated GitHub repo URL.
     /// Returns None if not a valid GitHub repository URL.
+    ///
+    /// Note: Owner and name are normalized to lowercase. GitHub treats
+    /// `Owner/Repo` and `owner/repo` as the same repository, and on
+    /// case-insensitive filesystems (macOS, Windows), having both
+    /// could corrupt clones.
     pub fn parse(s: &str) -> Option<Self> {
         let url = Url::parse(s).ok()?;
 
@@ -34,8 +44,9 @@ impl GitHubRepoUrl {
             return None;
         }
 
-        let owner = parts[0].to_string();
-        let name = parts[1].trim_end_matches(".git").to_string();
+        // Normalize to lowercase for consistency with GitHub's case-insensitive behavior
+        let owner = parts[0].to_lowercase();
+        let name = parts[1].trim_end_matches(".git").to_lowercase();
 
         if owner.is_empty() || name.is_empty() {
             return None;
@@ -148,11 +159,13 @@ mod tests {
 
     #[test]
     fn parses_valid_github_urls() {
+        // Note: owner and name are normalized to lowercase
         let cases = [
             ("https://github.com/owner/repo", "owner", "repo"),
             ("https://github.com/owner/repo.git", "owner", "repo"),
-            ("https://github.com/Rust-Lang/rust", "Rust-Lang", "rust"),
+            ("https://github.com/Rust-Lang/rust", "rust-lang", "rust"), // normalized
             ("https://github.com/a/b", "a", "b"),
+            ("https://github.com/OWNER/REPO", "owner", "repo"), // normalized
         ];
 
         for (url, expected_owner, expected_name) in cases {
@@ -162,6 +175,19 @@ mod tests {
             assert_eq!(parsed.owner(), expected_owner);
             assert_eq!(parsed.name(), expected_name);
         }
+    }
+
+    #[test]
+    fn case_insensitive_urls_produce_same_owner_name() {
+        let url1 = GitHubRepoUrl::parse("https://github.com/Owner/Repo").unwrap();
+        let url2 = GitHubRepoUrl::parse("https://github.com/owner/repo").unwrap();
+        let url3 = GitHubRepoUrl::parse("https://github.com/OWNER/REPO").unwrap();
+
+        // All should normalize to the same values
+        assert_eq!(url1.owner(), url2.owner());
+        assert_eq!(url2.owner(), url3.owner());
+        assert_eq!(url1.name(), url2.name());
+        assert_eq!(url2.name(), url3.name());
     }
 
     #[test]
@@ -215,8 +241,9 @@ mod tests {
 
             prop_assert!(parsed.is_some());
             let parsed = parsed.unwrap();
-            prop_assert_eq!(parsed.owner(), owner);
-            prop_assert_eq!(parsed.name(), name.trim_end_matches(".git"));
+            // Owner and name are normalized to lowercase
+            prop_assert_eq!(parsed.owner(), owner.to_lowercase());
+            prop_assert_eq!(parsed.name(), name.trim_end_matches(".git").to_lowercase());
         }
 
         #[test]

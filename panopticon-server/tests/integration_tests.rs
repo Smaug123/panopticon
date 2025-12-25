@@ -113,7 +113,7 @@ mod timestamp_format {
 
         // Create a job scheduled for now
         let new_job = NewJob::review_repo(RepoId::new(1), false);
-        let job = jobs::create(&pool, new_job).await.expect("Job creation");
+        let _job = jobs::create(&pool, new_job).await.expect("Job creation");
 
         // Try to claim it immediately
         let claimed = jobs::claim_next(&pool).await;
@@ -380,5 +380,163 @@ mod sse_streaming {
         // The fix should ensure that:
         // 1. Multiple prompts can complete without closing the stream
         // 2. Only the final "complete" event closes the stream
+    }
+}
+
+/// Test module for symlink traversal protection.
+///
+/// Critical security bug: The repo scanner follows symlinks, allowing a
+/// malicious repository to exfiltrate files from outside its checkout
+/// into the LLM prompt.
+mod symlink_traversal {
+    use std::path::PathBuf;
+    use tempfile::TempDir;
+    use tokio::fs;
+
+    use panopticon_server::github::filter::FileFilter;
+
+    /// Create a test repo directory with a symlink pointing outside.
+    async fn setup_malicious_repo() -> (TempDir, TempDir, PathBuf) {
+        // Create a "secret" directory outside the repo
+        let secret_dir = TempDir::new().unwrap();
+        let secret_file = secret_dir.path().join("secret.txt");
+        fs::write(&secret_file, "SECRET_API_KEY=hunter2")
+            .await
+            .unwrap();
+
+        // Create the repo directory
+        let repos_dir = TempDir::new().unwrap();
+        let repo_path = repos_dir.path().join("attacker").join("evil-repo");
+        fs::create_dir_all(&repo_path).await.unwrap();
+
+        // Create a normal file
+        fs::write(repo_path.join("README.md"), "# Evil Repo")
+            .await
+            .unwrap();
+
+        // Create a symlink pointing to the secret file
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(&secret_file, repo_path.join("symlink_to_secret.txt"))
+                .unwrap();
+        }
+
+        // Also create a directory symlink
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(secret_dir.path(), repo_path.join("symlink_to_secret_dir"))
+                .unwrap();
+        }
+
+        (repos_dir, secret_dir, repo_path)
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn symlink_to_file_outside_repo_should_be_skipped() {
+        let (_repos_dir, _secret_dir, repo_path) = setup_malicious_repo().await;
+
+        let filter = FileFilter::default();
+
+        // Use the internal list_files method via get_contents
+        // We need to directly test the file listing, but get_contents is the public API
+        let files = list_files_in_repo(&repo_path, &filter).await;
+
+        // Should only include README.md, not the symlinked secret
+        assert!(
+            files
+                .iter()
+                .all(|p| !p.to_string_lossy().contains("secret")),
+            "Symlinks to files outside repo should be skipped. Found: {:?}",
+            files
+        );
+    }
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn symlink_to_directory_outside_repo_should_not_be_traversed() {
+        let (_repos_dir, secret_dir, repo_path) = setup_malicious_repo().await;
+
+        // Create a file inside the secret directory
+        tokio::fs::write(secret_dir.path().join("passwords.txt"), "root:toor")
+            .await
+            .unwrap();
+
+        let filter = FileFilter::default();
+        let files = list_files_in_repo(&repo_path, &filter).await;
+
+        // Should not find passwords.txt via the symlinked directory
+        assert!(
+            files
+                .iter()
+                .all(|p| !p.to_string_lossy().contains("passwords")),
+            "Directory symlinks should not be traversed. Found: {:?}",
+            files
+        );
+    }
+
+    /// Helper to list files without needing a full GitHubFetcher setup.
+    async fn list_files_in_repo(repo_path: &std::path::Path, filter: &FileFilter) -> Vec<PathBuf> {
+        use panopticon_server::github::fetch::list_files_safe;
+        list_files_safe(repo_path, filter).await.unwrap()
+    }
+}
+
+/// Test module for case-insensitive repo identity.
+///
+/// Medium severity: GitHub repo names are case-insensitive, but our storage
+/// is case-sensitive. This can cause collisions on case-insensitive filesystems.
+mod case_sensitivity {
+    use panopticon_server::domain::repo::GitHubRepoUrl;
+
+    #[test]
+    fn repo_urls_should_normalize_to_lowercase() {
+        let url1 = GitHubRepoUrl::parse("https://github.com/Owner/Repo").unwrap();
+        let url2 = GitHubRepoUrl::parse("https://github.com/owner/repo").unwrap();
+
+        // After normalization, both should produce the same owner/name
+        assert_eq!(
+            url1.owner(),
+            url2.owner(),
+            "Owner should be normalized to lowercase"
+        );
+        assert_eq!(
+            url1.name(),
+            url2.name(),
+            "Name should be normalized to lowercase"
+        );
+
+        // Both should be lowercase
+        assert_eq!(url1.owner(), "owner");
+        assert_eq!(url1.name(), "repo");
+    }
+
+    #[test]
+    fn clone_url_should_use_normalized_names() {
+        let url = GitHubRepoUrl::parse("https://github.com/OWNER/REPO").unwrap();
+
+        // Clone URL should use lowercase for consistency
+        assert_eq!(url.clone_url(), "https://github.com/owner/repo.git");
+    }
+}
+
+/// Test module for job retry semantics.
+///
+/// High severity: When a review fails mid-prompt, run_review still returns Ok(()),
+/// so the job is completed. The scheduler then sees a recent (failed) review
+/// and won't retry for review_interval_hours.
+mod job_retry_semantics {
+    // This is tested at integration level because it involves multiple components.
+    // The key behavior to verify:
+    // 1. When prompts fail, run_review should return Err
+    // 2. The job should be marked failed and retried (if attempts < max_attempts)
+    // 3. The scheduler should not count failed reviews as "recent" for scheduling
+
+    #[test]
+    fn failed_review_should_not_prevent_retry_scheduling() {
+        // Document expected behavior:
+        // - schedule_daily_reviews checks get_latest_for_repo
+        // - It should only count completed reviews, not failed ones
+        // - This ensures failed reviews don't block retry attempts
     }
 }

@@ -178,37 +178,94 @@ impl GitHubFetcher {
         repo_path: &Path,
         filter: &FileFilter,
     ) -> Result<Vec<PathBuf>, FetchError> {
-        let mut files = Vec::new();
-        let mut stack = vec![repo_path.to_path_buf()];
+        list_files_safe(repo_path, filter).await
+    }
+}
 
-        while let Some(dir) = stack.pop() {
-            let mut entries = tokio::fs::read_dir(&dir).await?;
+/// List files in a repository directory, safely handling symlinks.
+///
+/// SECURITY: This function does NOT follow symlinks to prevent path traversal attacks.
+/// A malicious repository could contain symlinks pointing outside the repo directory,
+/// which would allow exfiltrating host files into the LLM prompt.
+///
+/// This function is public for testing purposes.
+pub async fn list_files_safe(
+    repo_path: &Path,
+    filter: &FileFilter,
+) -> Result<Vec<PathBuf>, FetchError> {
+    // Canonicalize the repo path to resolve any symlinks in the path itself
+    // This gives us an absolute path to compare against.
+    let canonical_repo = repo_path.canonicalize()?;
 
-            while let Some(entry) = entries.next_entry().await? {
-                let path = entry.path();
-                let metadata = entry.metadata().await?;
+    let mut files = Vec::new();
+    let mut stack = vec![repo_path.to_path_buf()];
 
-                if metadata.is_dir() {
-                    // Check if directory should be traversed
-                    let relative = path.strip_prefix(repo_path).unwrap_or(&path);
-                    if filter.should_include(relative, 0) {
-                        stack.push(path);
+    while let Some(dir) = stack.pop() {
+        let mut entries = tokio::fs::read_dir(&dir).await?;
+
+        while let Some(entry) = entries.next_entry().await? {
+            let path = entry.path();
+
+            // Use symlink_metadata which does NOT follow symlinks.
+            // This tells us the type of the entry itself, not what it points to.
+            let metadata = tokio::fs::symlink_metadata(&path).await?;
+
+            // Skip symlinks entirely - they could point outside the repo
+            if metadata.file_type().is_symlink() {
+                tracing::debug!(
+                    "Skipping symlink: {} (security: symlinks are not followed)",
+                    path.display()
+                );
+                continue;
+            }
+
+            if metadata.is_dir() {
+                // Verify the directory is still within the repo after canonicalization
+                // This catches edge cases where the path might escape via .. or other means
+                if let Ok(canonical_dir) = path.canonicalize() {
+                    if !canonical_dir.starts_with(&canonical_repo) {
+                        tracing::warn!(
+                            "Skipping directory outside repo: {} -> {}",
+                            path.display(),
+                            canonical_dir.display()
+                        );
+                        continue;
                     }
-                } else if metadata.is_file() {
-                    let relative = path.strip_prefix(repo_path).unwrap_or(&path);
-                    if filter.should_include(relative, metadata.len()) {
-                        files.push(path);
+                }
+
+                // Check if directory should be traversed
+                let relative = path.strip_prefix(repo_path).unwrap_or(&path);
+                if filter.should_include(relative, 0) {
+                    stack.push(path);
+                }
+            } else if metadata.is_file() {
+                // Verify the file is still within the repo
+                if let Ok(canonical_file) = path.canonicalize() {
+                    if !canonical_file.starts_with(&canonical_repo) {
+                        tracing::warn!(
+                            "Skipping file outside repo: {} -> {}",
+                            path.display(),
+                            canonical_file.display()
+                        );
+                        continue;
                     }
+                }
+
+                let relative = path.strip_prefix(repo_path).unwrap_or(&path);
+                if filter.should_include(relative, metadata.len()) {
+                    files.push(path);
                 }
             }
         }
-
-        // Sort for consistent ordering
-        files.sort();
-        Ok(files)
     }
 
-    /// Delete the local clone of a repository.
+    // Sort for consistent ordering
+    files.sort();
+    Ok(files)
+}
+
+/// Delete the local clone of a repository.
+impl GitHubFetcher {
     pub async fn delete(&self, url: &GitHubRepoUrl) -> Result<(), FetchError> {
         let repo_path = self.repo_path(url);
         if repo_path.exists() {

@@ -40,6 +40,22 @@ async fn main() -> Result<()> {
     tracing::info!("Running database migrations");
     sqlx::migrate!("./migrations").run(&db).await?;
 
+    // Verify SQLite JSON1 extension is available (required for job queue queries)
+    tracing::debug!("Verifying SQLite JSON1 extension availability");
+    sqlx::query_scalar::<_, i64>("SELECT json_extract('{\"test\": 1}', '$.test')")
+        .fetch_one(&db)
+        .await
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "SQLite JSON1 extension is required but not available. \
+                 The JSON1 extension is needed for job queue queries. \
+                 Please ensure your SQLite installation includes JSON1 support. \
+                 Error: {}",
+                e
+            )
+        })?;
+    tracing::debug!("SQLite JSON1 extension verified");
+
     // Initialize LLM provider
     let llm: Arc<dyn LlmProvider> = match &config.llm.provider {
         LlmProviderConfig::OpenAi {
