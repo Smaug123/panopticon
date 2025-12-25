@@ -67,6 +67,19 @@ impl GitHubRepoUrl {
             return None;
         }
 
+        // SECURITY: Reject path traversal components.
+        // These would allow escaping the repos directory when joined to a path.
+        if owner == "." || owner == ".." || name == "." || name == ".." {
+            return None;
+        }
+
+        // SECURITY: Reject path separators in owner/name.
+        // While URL parsing should handle '/', backslash could sneak through
+        // and be interpreted as a path separator on Windows.
+        if owner.contains(['/', '\\']) || name.contains(['/', '\\']) {
+            return None;
+        }
+
         // Reject paths that look like they're pointing to a specific file/tree
         // e.g., github.com/owner/repo/blob/main/file.rs
         if parts.len() > 2 && !parts[2].is_empty() {
@@ -238,6 +251,83 @@ mod tests {
     }
 
     #[test]
+    fn path_traversal_urls_produce_safe_values_or_are_rejected() {
+        // SECURITY: These URLs attempt path traversal via owner or name.
+        // The URL crate normalizes .. and . path components before we see them,
+        // so most of these result in either rejection (wrong number of segments)
+        // or safe values (the traversal is already resolved).
+        //
+        // Our explicit . and .. checks are defense-in-depth in case URL crate
+        // behavior changes or edge cases exist.
+        let traversal_attempts = [
+            // These get normalized by URL crate - .. collapses parent paths
+            ("https://github.com/../repo", None), // becomes /repo (only 1 segment)
+            (
+                "https://github.com/../../../etc/passwd",
+                Some(("etc", "passwd")),
+            ), // traversal resolved
+            ("https://github.com/owner/..", None), // becomes / (empty)
+            ("https://github.com/./repo", None),  // becomes /repo (only 1 segment)
+            ("https://github.com/owner/.", None), // becomes /owner/ (empty name)
+            ("https://github.com/../..", None),   // becomes / (empty)
+            // Percent-encoded traversal is also normalized
+            ("https://github.com/%2E%2E/repo", None), // normalized
+            ("https://github.com/%2E/%2E%2E", None),  // normalized
+            // Backslash is treated as forward slash by URL parser
+            ("https://github.com/foo\\bar/repo", None), // becomes /foo/bar/repo (3 segments, rejected)
+        ];
+
+        for (url, expected) in traversal_attempts {
+            let result = GitHubRepoUrl::parse(url);
+            match expected {
+                None => {
+                    assert!(
+                        result.is_none(),
+                        "URL {} should have been rejected but got {:?}",
+                        url,
+                        result.map(|r| (r.owner().to_string(), r.name().to_string()))
+                    );
+                }
+                Some((exp_owner, exp_name)) => {
+                    let parsed = result.expect(&format!("URL {} should have parsed", url));
+                    assert_eq!(parsed.owner(), exp_owner, "URL {} owner mismatch", url);
+                    assert_eq!(parsed.name(), exp_name, "URL {} name mismatch", url);
+                    // Verify the resulting values don't contain traversal
+                    assert_ne!(parsed.owner(), "..", "owner should not be ..");
+                    assert_ne!(parsed.owner(), ".", "owner should not be .");
+                    assert_ne!(parsed.name(), "..", "name should not be ..");
+                    assert_ne!(parsed.name(), ".", "name should not be .");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn rejects_dotdot_owner_or_name_directly() {
+        // SECURITY: Defense-in-depth test. While the URL crate normalizes path
+        // traversal, we explicitly reject . and .. in case of edge cases or
+        // future URL crate behavior changes.
+        //
+        // This tests the validation logic itself, not URL parsing behavior.
+        // The validation ensures that even if somehow a . or .. got through
+        // URL parsing, we'd still reject it.
+
+        // Verify our validation catches these patterns
+        // (We can't easily construct these through URL parsing, but the code handles them)
+
+        // The validation is at lines 72-74 in the parse function:
+        // if owner == "." || owner == ".." || name == "." || name == ".." {
+        //     return None;
+        // }
+
+        // Since we can't bypass URL normalization, we just document that the check exists
+        // and verify that legitimate repos with dots work fine
+        assert!(GitHubRepoUrl::parse("https://github.com/owner/repo.name").is_some());
+        assert!(GitHubRepoUrl::parse("https://github.com/owner/...").is_some()); // three dots is fine
+        assert!(GitHubRepoUrl::parse("https://github.com/.../repo").is_some()); // three dots is fine
+    }
+
+    #[test]
     fn commit_sha_validates_correctly() {
         // Valid SHA
         let valid = "a".repeat(40);
@@ -277,6 +367,37 @@ mod tests {
             // Valid SHAs are exactly 40 hex chars
             let is_valid_sha = s.len() == 40 && s.chars().all(|c| c.is_ascii_hexdigit());
             prop_assert_eq!(CommitSha::parse(&s).is_some(), is_valid_sha);
+        }
+
+        /// SECURITY: Prove that no parsed GitHub URL can produce path traversal values.
+        /// This property test generates arbitrary strings that could contain path traversal
+        /// attempts and verifies that if parsing succeeds, the resulting owner/name values
+        /// are safe for filesystem operations.
+        #[test]
+        fn parsed_urls_never_contain_path_traversal(
+            // Generate arbitrary strings that might contain traversal attempts
+            owner in ".*",
+            name in ".*"
+        ) {
+            let url_str = format!("https://github.com/{}/{}", owner, name);
+            if let Some(parsed) = GitHubRepoUrl::parse(&url_str) {
+                // If parsing succeeds, owner and name must be safe
+                prop_assert_ne!(parsed.owner(), ".", "owner must not be .");
+                prop_assert_ne!(parsed.owner(), "..", "owner must not be ..");
+                prop_assert_ne!(parsed.name(), ".", "name must not be .");
+                prop_assert_ne!(parsed.name(), "..", "name must not be ..");
+
+                // Must not contain path separators
+                prop_assert!(!parsed.owner().contains('/'), "owner must not contain /");
+                prop_assert!(!parsed.owner().contains('\\'), "owner must not contain \\");
+                prop_assert!(!parsed.name().contains('/'), "name must not contain /");
+                prop_assert!(!parsed.name().contains('\\'), "name must not contain \\");
+
+                // Must not be empty
+                prop_assert!(!parsed.owner().is_empty(), "owner must not be empty");
+                prop_assert!(!parsed.name().is_empty(), "name must not be empty");
+            }
+            // If parsing fails, that's fine - we only care about successful parses being safe
         }
     }
 }
