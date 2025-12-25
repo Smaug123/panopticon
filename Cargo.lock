@@ -1410,6 +1410,7 @@ dependencies = [
  "glob",
  "mime_guess",
  "proptest",
+ "rand 0.8.5",
  "reqwest",
  "rust-embed",
  "serde",

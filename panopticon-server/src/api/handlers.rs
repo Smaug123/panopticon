@@ -455,3 +455,25 @@ pub async fn get_review(
         created_at: review.created_at.to_rfc3339(),
     }))
 }
+
+// --- Stream Tokens ---
+
+#[derive(Serialize)]
+pub struct StreamTokenResponse {
+    pub token: String,
+}
+
+/// Generate a short-lived stream token for SSE authentication.
+///
+/// This endpoint exchanges the API key (sent in the Authorization header)
+/// for a short-lived token that can be safely used in query strings for
+/// SSE connections. The token is valid for 30 seconds and can only be used once.
+///
+/// This prevents the long-lived API key from appearing in:
+/// - Browser history
+/// - Referrer headers
+/// - Server logs
+pub async fn create_stream_token(State(state): State<AppState>) -> Json<StreamTokenResponse> {
+    let token = state.stream_tokens.generate().await;
+    Json(StreamTokenResponse { token })
+}

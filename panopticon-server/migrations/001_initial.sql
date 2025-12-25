@@ -7,12 +7,14 @@ CREATE TABLE repos (
     owner TEXT NOT NULL,
     name TEXT NOT NULL,
     last_commit_sha TEXT,
+    last_checked_at TEXT,
     created_at TEXT NOT NULL DEFAULT (datetime('now')),
 
     UNIQUE(owner, name)
 );
 
 CREATE INDEX idx_repos_owner_name ON repos(owner, name);
+CREATE INDEX idx_repos_last_checked_at ON repos(last_checked_at);
 
 -- Prompts table (multiple per repo)
 CREATE TABLE prompts (

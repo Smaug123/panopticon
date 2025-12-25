@@ -137,17 +137,47 @@ pub async fn complete(pool: &SqlitePool, id: JobId) -> Result<(), sqlx::Error> {
     Ok(())
 }
 
+/// Calculate exponential backoff delay for retries.
+/// Base delay is 30 seconds, doubles with each attempt, capped at 1 hour.
+fn calculate_backoff_delay(attempts: u32) -> i64 {
+    let base_delay = 30i64; // 30 seconds
+    let max_delay = 3600i64; // 1 hour
+    let delay = base_delay * (1 << attempts.min(6)); // 2^attempts, capped at 2^6 = 64
+    delay.min(max_delay)
+}
+
 /// Mark a job as failed. If should_retry is true and attempts < max_attempts,
 /// set status back to pending for retry.
+///
+/// The `retry_after_secs` parameter controls when the job becomes eligible for retry:
+/// - `Some(secs)`: Schedule retry after this many seconds (e.g., for rate limit backoff)
+/// - `None`: Use exponential backoff based on attempt count
+///
+/// This prevents immediate retry loops that can hammer external APIs.
 pub async fn fail(
     pool: &SqlitePool,
     id: JobId,
     error: &str,
     should_retry: bool,
+    retry_after_secs: Option<u32>,
 ) -> Result<(), sqlx::Error> {
-    let now = Utc::now().to_rfc3339();
+    let now = Utc::now();
+    let now_str = now.to_rfc3339();
+
     if should_retry {
-        // Set back to pending for retry
+        // First get the current attempts to calculate backoff
+        let attempts: i64 = sqlx::query_scalar("SELECT attempts FROM jobs WHERE id = ?")
+            .bind(id.into_inner())
+            .fetch_one(pool)
+            .await?;
+
+        // Calculate the retry delay
+        let delay_secs = retry_after_secs
+            .map(|s| s as i64)
+            .unwrap_or_else(|| calculate_backoff_delay(attempts as u32));
+        let scheduled_at = (now + chrono::Duration::seconds(delay_secs)).to_rfc3339();
+
+        // Set back to pending for retry with updated scheduled_at
         sqlx::query(
             r#"
             UPDATE jobs
@@ -156,6 +186,10 @@ pub async fn fail(
                     ELSE 'failed'
                 END,
                 last_error = ?,
+                scheduled_at = CASE
+                    WHEN attempts < max_attempts THEN ?
+                    ELSE scheduled_at
+                END,
                 completed_at = CASE
                     WHEN attempts >= max_attempts THEN ?
                     ELSE NULL
@@ -164,7 +198,8 @@ pub async fn fail(
             "#,
         )
         .bind(error)
-        .bind(&now)
+        .bind(&scheduled_at)
+        .bind(&now_str)
         .bind(id.into_inner())
         .execute(pool)
         .await?;
@@ -176,7 +211,7 @@ pub async fn fail(
             WHERE id = ?
             "#,
         )
-        .bind(&now)
+        .bind(&now_str)
         .bind(error)
         .bind(id.into_inner())
         .execute(pool)

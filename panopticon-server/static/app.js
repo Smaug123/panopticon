@@ -493,9 +493,28 @@ function renderReviewDetail() {
     `).join('');
 }
 
-function startReviewStream(reviewId) {
-    // EventSource cannot send Authorization headers, so we pass the token as a query param
-    const eventSource = new EventSource(`/api/reviews/${reviewId}/stream?token=${encodeURIComponent(state.apiKey)}`);
+async function startReviewStream(reviewId) {
+    // Get a short-lived stream token to avoid putting the API key in the URL.
+    // Stream tokens are single-use and expire after 30 seconds.
+    let streamToken;
+    try {
+        const response = await fetch('/api/stream-token', {
+            method: 'POST',
+            headers: {
+                'Authorization': `Bearer ${state.apiKey}`
+            }
+        });
+        if (!response.ok) {
+            throw new Error('Failed to get stream token');
+        }
+        const data = await response.json();
+        streamToken = data.token;
+    } catch (error) {
+        console.error('Failed to get stream token:', error);
+        return;
+    }
+
+    const eventSource = new EventSource(`/api/reviews/${reviewId}/stream?token=${encodeURIComponent(streamToken)}`);
     let currentPrompt = '';
     let content = {};
 

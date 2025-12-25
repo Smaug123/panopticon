@@ -41,4 +41,7 @@ pub struct AppState {
     pub github: Arc<github::fetch::GitHubFetcher>,
     /// Broadcast channel for streaming review updates to SSE clients.
     pub review_updates: broadcast::Sender<ReviewUpdate>,
+    /// Short-lived stream tokens for SSE authentication.
+    /// These prevent API keys from appearing in query strings.
+    pub stream_tokens: api::stream_token::StreamTokenStore,
 }

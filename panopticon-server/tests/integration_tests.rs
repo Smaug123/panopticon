@@ -1063,6 +1063,62 @@ mod scheduling_loop_prevention {
 mod review_cleanup_on_error {
     use super::*;
 
+    /// Test that the cleanup guard preserves the real error message.
+    ///
+    /// The bug: The cleanup guard always stores "Review interrupted..." message
+    /// instead of the actual error that caused the failure.
+    #[tokio::test]
+    async fn cleanup_guard_should_preserve_real_error() {
+        let pool = setup_db().await;
+
+        // Create a repo
+        sqlx::query(
+            r#"
+            INSERT INTO repos (url, owner, name, created_at)
+            VALUES ('https://github.com/test/error', 'test', 'error', '2024-01-01T00:00:00Z')
+            "#,
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        use panopticon_server::db::reviews;
+        use panopticon_server::domain::ids::RepoId;
+        use panopticon_server::domain::repo::CommitSha;
+        use panopticon_server::domain::review::{NewReview, ReviewStatus, ReviewTrigger};
+
+        let sha = CommitSha::parse("abcdef1234567890abcdef1234567890abcdef12").unwrap();
+        let review = reviews::create(
+            &pool,
+            NewReview {
+                repo_id: RepoId::new(1),
+                commit_sha: sha,
+                trigger: ReviewTrigger::Manual,
+            },
+        )
+        .await
+        .unwrap();
+
+        // Mark as in_progress then fail with a specific error message
+        reviews::mark_in_progress(&pool, review.id).await.unwrap();
+        let specific_error = "LLM rate limited: retry after 60s";
+        reviews::mark_failed(&pool, review.id, specific_error)
+            .await
+            .unwrap();
+
+        // The error should be preserved, not replaced with generic message
+        let failed = reviews::get_by_id(&pool, review.id).await.unwrap().unwrap();
+        match failed.status {
+            ReviewStatus::Failed { error, .. } => {
+                assert_eq!(
+                    error, specific_error,
+                    "Error message should be preserved, not generic"
+                );
+            }
+            other => panic!("Expected Failed status, got: {:?}", other),
+        }
+    }
+
     /// Test that reviews don't get stuck in_progress when errors occur.
     ///
     /// The bug: After mark_in_progress is called, if any subsequent operation
@@ -1179,6 +1235,404 @@ mod sse_terminal_events {
             failed,
             ReviewStatus::Completed { .. } | ReviewStatus::Failed { .. }
         ));
+    }
+}
+
+/// Test module for stream token authentication.
+///
+/// Low severity: API keys in query strings can leak via logs/referrers/history.
+/// Stream tokens are short-lived and single-use to mitigate this risk.
+mod stream_token_auth {
+    use panopticon_server::api::stream_token::StreamTokenStore;
+
+    #[tokio::test]
+    async fn stream_tokens_are_single_use() {
+        let store = StreamTokenStore::new();
+
+        // Generate a token
+        let token = store.generate().await;
+
+        // First use should succeed
+        assert!(
+            store.validate_and_consume(&token).await,
+            "First use of stream token should succeed"
+        );
+
+        // Second use should fail
+        assert!(
+            !store.validate_and_consume(&token).await,
+            "Second use of stream token should fail (single-use)"
+        );
+    }
+
+    #[tokio::test]
+    async fn invalid_tokens_are_rejected() {
+        let store = StreamTokenStore::new();
+
+        // Generate one token to ensure the store is initialized
+        let _valid = store.generate().await;
+
+        // Try to use an invalid token
+        assert!(
+            !store.validate_and_consume("invalid-token").await,
+            "Invalid token should be rejected"
+        );
+    }
+
+    #[tokio::test]
+    async fn different_tokens_are_independent() {
+        let store = StreamTokenStore::new();
+
+        // Generate two tokens
+        let token1 = store.generate().await;
+        let token2 = store.generate().await;
+
+        // Using token1 should not affect token2
+        assert!(store.validate_and_consume(&token1).await);
+        assert!(
+            store.validate_and_consume(&token2).await,
+            "Using one token should not invalidate another"
+        );
+    }
+}
+
+/// Test module for SQLite concurrency.
+///
+/// Medium severity: The pool uses multiple connections without busy timeout/WAL,
+/// which can cause "database is locked" errors under concurrent load.
+mod sqlite_concurrency {
+    use sqlx::sqlite::SqlitePoolOptions;
+    use sqlx::SqlitePool;
+    use std::sync::Arc;
+
+    #[tokio::test]
+    async fn concurrent_writes_should_not_fail() {
+        // Use a file-based database for proper WAL testing
+        let temp_dir = std::env::temp_dir().join(format!("panopticon_test_{}", std::process::id()));
+        std::fs::create_dir_all(&temp_dir).unwrap();
+        let db_path = temp_dir.join("test.db");
+
+        // Create pool with the same configuration as production
+        let pool: SqlitePool = SqlitePoolOptions::new()
+            .max_connections(5)
+            .connect(&format!("sqlite:{}?mode=rwc", db_path.display()))
+            .await
+            .unwrap();
+
+        // Run migrations
+        sqlx::migrate!("./migrations").run(&pool).await.unwrap();
+
+        // Enable WAL mode (this should be done in production config)
+        sqlx::query("PRAGMA journal_mode=WAL")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        // Set busy timeout (this should be done in production config)
+        sqlx::query("PRAGMA busy_timeout=5000")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let pool = Arc::new(pool);
+
+        // Spawn multiple concurrent write tasks
+        let mut handles = Vec::new();
+        for i in 0..10 {
+            let pool = Arc::clone(&pool);
+            handles.push(tokio::spawn(async move {
+                let url = format!("https://github.com/test/concurrent{}", i);
+                sqlx::query(
+                    r#"
+                    INSERT INTO repos (url, owner, name, created_at)
+                    VALUES (?, ?, ?, datetime('now'))
+                    "#,
+                )
+                .bind(&url)
+                .bind("test")
+                .bind(format!("concurrent{}", i))
+                .execute(pool.as_ref())
+                .await
+            }));
+        }
+
+        // All writes should succeed without "database is locked" errors
+        for handle in handles {
+            let result: Result<_, _> = handle.await.unwrap();
+            assert!(
+                result.is_ok(),
+                "Concurrent write failed: {:?}",
+                result.err()
+            );
+        }
+
+        // Cleanup
+        drop(pool);
+        std::fs::remove_dir_all(&temp_dir).ok();
+    }
+}
+
+/// Test module for chunking with model context limits.
+///
+/// Medium severity: The default chunking uses a fixed 100k token cap, but different
+/// models have different context limits. This can cause context_length_exceeded errors.
+mod chunking_context_limit {
+    use panopticon_server::github::concat::ChunkingStrategy;
+
+    #[test]
+    fn chunking_strategy_should_use_model_context_limit() {
+        // The strategy should be configurable with a specific token limit
+        let strategy = ChunkingStrategy::with_max_tokens(50_000);
+        match strategy {
+            ChunkingStrategy::ByFile {
+                max_tokens_per_chunk,
+            } => {
+                assert_eq!(max_tokens_per_chunk, 50_000);
+            }
+            _ => panic!("Expected ByFile strategy"),
+        }
+    }
+
+    #[test]
+    fn default_strategy_should_have_reasonable_limit() {
+        // Default should not exceed common model limits
+        let strategy = ChunkingStrategy::default();
+        match strategy {
+            ChunkingStrategy::ByFile {
+                max_tokens_per_chunk,
+            } => {
+                // Should be no more than a typical large context model (200k)
+                assert!(
+                    max_tokens_per_chunk <= 200_000,
+                    "Default limit {} is too high",
+                    max_tokens_per_chunk
+                );
+            }
+            _ => panic!("Expected ByFile strategy"),
+        }
+    }
+}
+
+/// Test module for no-change check tracking.
+///
+/// High severity: When run_review returns early (no changes), it doesn't record
+/// a "checked" timestamp, so schedule_daily_reviews keeps scheduling jobs.
+mod no_change_tracking {
+    use super::*;
+    use chrono::Utc;
+
+    #[tokio::test]
+    async fn repos_should_track_last_checked_at() {
+        let pool = setup_db().await;
+
+        // Create a repo
+        sqlx::query(
+            r#"
+            INSERT INTO repos (url, owner, name, created_at)
+            VALUES ('https://github.com/test/unchanged', 'test', 'unchanged', '2024-01-01T00:00:00Z')
+            "#,
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        use panopticon_server::db::repos;
+        use panopticon_server::domain::ids::RepoId;
+
+        // Initially, last_checked_at should be null
+        let repo = repos::get_by_id(&pool, RepoId::new(1))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            repo.last_checked_at.is_none(),
+            "Initially should have no last_checked_at"
+        );
+
+        // Update last_checked_at
+        let now = Utc::now();
+        repos::update_last_checked(&pool, RepoId::new(1))
+            .await
+            .unwrap();
+
+        // Now it should have a timestamp
+        let repo = repos::get_by_id(&pool, RepoId::new(1))
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            repo.last_checked_at.is_some(),
+            "Should have last_checked_at after update"
+        );
+
+        // The timestamp should be recent (within 5 seconds of now)
+        let last_checked = repo.last_checked_at.unwrap();
+        let diff = (now - last_checked).num_seconds().abs();
+        assert!(
+            diff < 5,
+            "last_checked_at should be recent, got diff of {}s",
+            diff
+        );
+    }
+
+    #[tokio::test]
+    async fn recently_checked_repo_should_not_be_scheduled() {
+        let pool = setup_db().await;
+
+        // Create a repo that was checked recently but has no completed reviews
+        sqlx::query(
+            r#"
+            INSERT INTO repos (url, owner, name, last_checked_at, created_at)
+            VALUES ('https://github.com/test/recent', 'test', 'recent', datetime('now'), '2024-01-01T00:00:00Z')
+            "#,
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        // Create an enabled prompt so the repo is schedulable
+        sqlx::query(
+            r#"
+            INSERT INTO prompts (repo_id, name, text, enabled, is_default, created_at)
+            VALUES (1, 'Test', 'Review this', 1, 1, '2024-01-01T00:00:00Z')
+            "#,
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        use panopticon_server::db::repos;
+        use panopticon_server::domain::ids::RepoId;
+
+        // The repo should NOT need a new check (recently checked)
+        let _repo = repos::get_by_id(&pool, RepoId::new(1))
+            .await
+            .unwrap()
+            .unwrap();
+        let needs_check = repos::needs_check(&pool, RepoId::new(1), 24).await.unwrap();
+
+        assert!(
+            !needs_check,
+            "Recently checked repo should not need another check"
+        );
+    }
+}
+
+/// Test module for job retry delay.
+///
+/// High severity: jobs::fail flips status back to pending without delaying or
+/// updating scheduled_at, so a failing job can be retried in the same tick.
+mod job_retry_delay {
+    use super::*;
+    use chrono::{Duration, Utc};
+
+    #[tokio::test]
+    async fn failed_job_should_have_delayed_scheduled_at() {
+        let pool = setup_db().await;
+
+        use panopticon_server::db::jobs;
+        use panopticon_server::domain::ids::RepoId;
+        use panopticon_server::domain::job::NewJob;
+
+        // Create and claim a job
+        let new_job = NewJob::review_repo(RepoId::new(1), false);
+        jobs::create(&pool, new_job).await.unwrap();
+
+        let claimed = jobs::claim_next(&pool).await.unwrap().unwrap();
+        let original_scheduled_at = claimed.scheduled_at;
+
+        // Fail the job with a 60-second retry delay
+        jobs::fail(&pool, claimed.id, "test error", true, Some(60))
+            .await
+            .unwrap();
+
+        // Get the job directly from database to check scheduled_at
+        let row: (String,) = sqlx::query_as("SELECT scheduled_at FROM jobs WHERE id = ?")
+            .bind(claimed.id.into_inner())
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+
+        // Parse the scheduled_at
+        let new_scheduled_at = chrono::DateTime::parse_from_rfc3339(&row.0)
+            .unwrap()
+            .with_timezone(&Utc);
+
+        // The new scheduled_at should be at least 55 seconds in the future
+        // (using 55s instead of 60s to allow for timing variance)
+        let delay = new_scheduled_at - original_scheduled_at;
+        assert!(
+            delay >= Duration::seconds(55),
+            "Job should be delayed by at least 55s, got {:?}",
+            delay
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_job_with_default_delay_should_use_exponential_backoff() {
+        let pool = setup_db().await;
+
+        use panopticon_server::db::jobs;
+        use panopticon_server::domain::ids::RepoId;
+        use panopticon_server::domain::job::NewJob;
+
+        // Create and claim a job
+        let new_job = NewJob::review_repo(RepoId::new(1), false);
+        jobs::create(&pool, new_job).await.unwrap();
+
+        let claimed = jobs::claim_next(&pool).await.unwrap().unwrap();
+
+        // Fail the job with no explicit delay (should use default backoff)
+        jobs::fail(&pool, claimed.id, "test error", true, None)
+            .await
+            .unwrap();
+
+        // Check that scheduled_at was updated
+        let row: (String,) = sqlx::query_as("SELECT scheduled_at FROM jobs WHERE id = ?")
+            .bind(claimed.id.into_inner())
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+
+        let new_scheduled_at = chrono::DateTime::parse_from_rfc3339(&row.0)
+            .unwrap()
+            .with_timezone(&Utc);
+
+        // Should be in the future (at least a few seconds)
+        let now = Utc::now();
+        assert!(
+            new_scheduled_at > now,
+            "Failed job should be scheduled in the future, got {:?} vs now {:?}",
+            new_scheduled_at,
+            now
+        );
+    }
+
+    #[tokio::test]
+    async fn delayed_job_should_not_be_claimed_immediately() {
+        let pool = setup_db().await;
+
+        use panopticon_server::db::jobs;
+        use panopticon_server::domain::ids::RepoId;
+        use panopticon_server::domain::job::NewJob;
+
+        // Create and claim a job
+        let new_job = NewJob::review_repo(RepoId::new(1), false);
+        jobs::create(&pool, new_job).await.unwrap();
+
+        let claimed = jobs::claim_next(&pool).await.unwrap().unwrap();
+
+        // Fail with a long delay
+        jobs::fail(&pool, claimed.id, "test error", true, Some(3600))
+            .await
+            .unwrap();
+
+        // Try to claim immediately - should get nothing
+        let next = jobs::claim_next(&pool).await.unwrap();
+        assert!(
+            next.is_none(),
+            "Delayed job should not be immediately claimable"
+        );
     }
 }
 

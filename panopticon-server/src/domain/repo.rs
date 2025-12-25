@@ -159,6 +159,9 @@ pub struct Repo {
     pub id: RepoId,
     pub url: GitHubRepoUrl,
     pub last_commit_sha: Option<CommitSha>,
+    /// When we last checked this repo for changes.
+    /// This prevents rescheduling jobs every poll interval for repos with no changes.
+    pub last_checked_at: Option<chrono::DateTime<chrono::Utc>>,
     pub created_at: chrono::DateTime<chrono::Utc>,
 }
 

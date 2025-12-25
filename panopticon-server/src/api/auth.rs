@@ -6,24 +6,18 @@ use axum::response::Response;
 
 use crate::AppState;
 
-/// Extract API key from a request.
-///
-/// Checks in order:
-/// 1. Authorization header: `Authorization: Bearer <token>`
-/// 2. Query parameter: `?token=<token>` (needed for EventSource/SSE which can't send headers)
-fn extract_api_key(request: &Request<Body>) -> Option<String> {
-    // Try Authorization header first
-    if let Some(auth_header) = request
+/// Extract API key from the Authorization header.
+fn extract_api_key_from_header(request: &Request<Body>) -> Option<String> {
+    request
         .headers()
         .get(header::AUTHORIZATION)
         .and_then(|h| h.to_str().ok())
-    {
-        if let Some(token) = auth_header.strip_prefix("Bearer ") {
-            return Some(token.to_string());
-        }
-    }
+        .and_then(|auth_header| auth_header.strip_prefix("Bearer "))
+        .map(|token| token.to_string())
+}
 
-    // Fall back to query parameter for SSE/EventSource clients
+/// Extract token from query parameter.
+fn extract_token_from_query(request: &Request<Body>) -> Option<String> {
     request.uri().query().and_then(|q| {
         url::form_urlencoded::parse(q.as_bytes())
             .find(|(k, _)| k == "token")
@@ -33,17 +27,39 @@ fn extract_api_key(request: &Request<Body>) -> Option<String> {
 
 /// Middleware that requires a valid API key.
 ///
-/// Supports two authentication methods:
-/// 1. Authorization header: `Authorization: Bearer <token>`
-/// 2. Query parameter: `?token=<token>` (needed for EventSource/SSE which can't send headers)
+/// Supports only Authorization header: `Authorization: Bearer <token>`
+/// For SSE endpoints, use `require_stream_token` instead to avoid
+/// exposing the API key in query strings.
 pub async fn require_api_key(
     State(state): State<AppState>,
     request: Request<Body>,
     next: Next,
 ) -> Result<Response, StatusCode> {
-    let provided_key = extract_api_key(&request).ok_or(StatusCode::UNAUTHORIZED)?;
+    let provided_key = extract_api_key_from_header(&request).ok_or(StatusCode::UNAUTHORIZED)?;
 
     if provided_key != state.config.auth.api_key {
+        return Err(StatusCode::UNAUTHORIZED);
+    }
+
+    Ok(next.run(request).await)
+}
+
+/// Middleware that requires a valid stream token (for SSE endpoints).
+///
+/// Stream tokens are short-lived (30s) and single-use. They are obtained
+/// by calling POST /api/stream-token with a valid API key, then used
+/// in the query string for SSE connections.
+///
+/// This prevents the long-lived API key from appearing in URLs which
+/// can leak via browser history, referrer headers, and server logs.
+pub async fn require_stream_token(
+    State(state): State<AppState>,
+    request: Request<Body>,
+    next: Next,
+) -> Result<Response, StatusCode> {
+    let token = extract_token_from_query(&request).ok_or(StatusCode::UNAUTHORIZED)?;
+
+    if !state.stream_tokens.validate_and_consume(&token).await {
         return Err(StatusCode::UNAUTHORIZED);
     }
 

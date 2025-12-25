@@ -4,6 +4,7 @@ use anyhow::Result;
 use tokio::sync::broadcast;
 use tracing_subscriber::EnvFilter;
 
+use panopticon_server::api::stream_token::StreamTokenStore;
 use panopticon_server::config::{AppConfig, LlmProviderConfig};
 use panopticon_server::github::fetch::GitHubFetcher;
 use panopticon_server::llm::openai::OpenAiProvider;
@@ -35,6 +36,14 @@ async fn main() -> Result<()> {
         .max_connections(5)
         .connect(&db_url)
         .await?;
+
+    // Configure SQLite for better concurrency:
+    // - WAL mode allows concurrent reads during writes
+    // - busy_timeout waits instead of immediately failing on lock contention
+    // This prevents "database is locked" errors under concurrent API + job runner load.
+    sqlx::query("PRAGMA journal_mode=WAL").execute(&db).await?;
+    sqlx::query("PRAGMA busy_timeout=5000").execute(&db).await?;
+    tracing::debug!("SQLite WAL mode and busy timeout configured");
 
     // Run migrations
     tracing::info!("Running database migrations");
@@ -78,12 +87,16 @@ async fn main() -> Result<()> {
     // Create broadcast channel for review updates (buffer 100 messages)
     let (review_updates, _) = broadcast::channel(100);
 
+    // Create stream token store for SSE authentication
+    let stream_tokens = StreamTokenStore::new();
+
     let state = AppState {
         db: db.clone(),
         config: config.clone(),
         llm,
         github,
         review_updates,
+        stream_tokens,
     };
 
     // Spawn background job runner

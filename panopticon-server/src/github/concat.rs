@@ -43,8 +43,22 @@ pub enum ChunkingStrategy {
     ByFile { max_tokens_per_chunk: u32 },
 }
 
+impl ChunkingStrategy {
+    /// Create a ByFile strategy with the specified token limit.
+    ///
+    /// This should be used with the model's max_context_tokens() to ensure
+    /// chunks fit within the model's context window.
+    pub fn with_max_tokens(max_tokens: u32) -> Self {
+        Self::ByFile {
+            max_tokens_per_chunk: max_tokens,
+        }
+    }
+}
+
 impl Default for ChunkingStrategy {
     fn default() -> Self {
+        // Default to a conservative limit that works with most models.
+        // Callers should use with_max_tokens() with the actual model limit.
         Self::ByFile {
             max_tokens_per_chunk: 100_000,
         }

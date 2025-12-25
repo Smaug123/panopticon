@@ -1,6 +1,5 @@
 use std::time::Duration;
 
-use chrono::Utc;
 use futures::StreamExt;
 use sqlx::SqlitePool;
 use tokio::time::interval;
@@ -11,11 +10,23 @@ use crate::domain::job::{Job, JobPayload, NewJob};
 use crate::domain::review::{NewReview, ReviewTrigger};
 use crate::github::concat::{chunk_contents, ChunkingStrategy};
 use crate::github::filter::FileFilter;
-use crate::llm::provider::LlmRequest;
+use crate::llm::provider::{LlmError, LlmRequest};
 use crate::llm::schema::build_system_prompt;
 use crate::AppState;
 use crate::ReviewUpdate;
 use crate::ReviewUpdateKind;
+
+/// Extract retry_after_secs from an error if it's a rate limit error.
+/// Looks through the error chain for LlmError::RateLimited.
+fn extract_retry_after(err: &anyhow::Error) -> Option<u32> {
+    // Check if the error chain contains a rate limit error
+    for cause in err.chain() {
+        if let Some(LlmError::RateLimited { retry_after_secs }) = cause.downcast_ref::<LlmError>() {
+            return Some(*retry_after_secs);
+        }
+    }
+    None
+}
 
 /// Guard that ensures a review is marked as failed if dropped without being disarmed.
 ///
@@ -30,6 +41,9 @@ struct ReviewCleanupGuard {
     /// If true, the guard will mark the review as failed on drop.
     /// Set to false when the review completes successfully.
     should_cleanup: bool,
+    /// The error message to use if cleanup is needed.
+    /// This preserves the actual error instead of using a generic message.
+    error_message: Option<String>,
 }
 
 impl ReviewCleanupGuard {
@@ -43,7 +57,25 @@ impl ReviewCleanupGuard {
             review_id,
             review_updates,
             should_cleanup: true,
+            error_message: None,
         }
+    }
+
+    /// Set the error message to use if cleanup is triggered.
+    /// This allows preserving the actual error instead of a generic message.
+    fn set_error(&mut self, error: impl Into<String>) {
+        self.error_message = Some(error.into());
+    }
+
+    /// Check a result and capture any error before propagating.
+    /// Use this instead of `?` to preserve the actual error message in the review.
+    ///
+    /// Example: `let value = guard.check(fallible_operation().await)?;`
+    fn check<T, E: std::fmt::Display>(&mut self, result: Result<T, E>) -> Result<T, E> {
+        if let Err(ref e) = result {
+            self.set_error(e.to_string());
+        }
+        result
     }
 
     /// Disarm the guard - the review completed successfully, no cleanup needed.
@@ -74,11 +106,15 @@ impl Drop for ReviewCleanupGuard {
             let db = self.db.clone();
             let review_id = self.review_id;
             let review_updates = self.review_updates.clone();
+            // Use the actual error if set, otherwise fall back to generic message
+            let error_msg = self
+                .error_message
+                .take()
+                .unwrap_or_else(|| "Review interrupted: process error or early return".to_string());
 
             // Use tokio::spawn to run cleanup asynchronously
             tokio::spawn(async move {
-                let error_msg = "Review interrupted: process error or early return";
-                if let Err(e) = reviews::mark_failed(&db, review_id, error_msg).await {
+                if let Err(e) = reviews::mark_failed(&db, review_id, &error_msg).await {
                     tracing::error!(
                         "Failed to mark review {} as failed during cleanup: {}",
                         review_id.into_inner(),
@@ -86,8 +122,9 @@ impl Drop for ReviewCleanupGuard {
                     );
                 } else {
                     tracing::warn!(
-                        "Review {} marked as failed due to early return",
-                        review_id.into_inner()
+                        "Review {} marked as failed: {}",
+                        review_id.into_inner(),
+                        error_msg
                     );
                 }
 
@@ -192,7 +229,20 @@ impl JobRunner {
                 tracing::error!("Job {} failed: {}", job.id, error_msg);
 
                 let should_retry = job.attempts < job.max_attempts;
-                if let Err(e) = jobs::fail(&self.state.db, job.id, &error_msg, should_retry).await {
+
+                // Extract retry_after from the error if it's a rate limit
+                // The error chain may contain LlmError::RateLimited
+                let retry_after_secs = extract_retry_after(&e);
+
+                if let Err(e) = jobs::fail(
+                    &self.state.db,
+                    job.id,
+                    &error_msg,
+                    should_retry,
+                    retry_after_secs,
+                )
+                .await
+                {
                     tracing::error!("Failed to mark job {} as failed: {}", job.id, e);
                 }
             }
@@ -219,6 +269,9 @@ impl JobRunner {
             if let Some(last_sha) = &repo.last_commit_sha {
                 if last_sha == &current_sha {
                     tracing::info!("No changes since last review, skipping");
+                    // Record that we checked, even though we're not doing a full review.
+                    // This prevents the scheduler from re-queueing this repo every poll.
+                    repos::update_last_checked(&self.state.db, repo_id).await?;
                     return Ok(());
                 }
             }
@@ -251,7 +304,8 @@ impl JobRunner {
 
         // Create cleanup guard - this ensures the review is marked as failed
         // if we early-return due to any error after this point.
-        let cleanup_guard = ReviewCleanupGuard::new(
+        // Use `cleanup_guard.check()` for fallible operations to preserve error messages.
+        let mut cleanup_guard = ReviewCleanupGuard::new(
             self.state.db.clone(),
             review.id,
             self.state.review_updates.clone(),
@@ -261,7 +315,8 @@ impl JobRunner {
 
         // Get repo contents
         let filter = FileFilter::default();
-        let contents = self.state.github.get_contents(&repo.url, &filter).await?;
+        let contents =
+            cleanup_guard.check(self.state.github.get_contents(&repo.url, &filter).await)?;
 
         tracing::info!(
             "Loaded {} files ({} bytes)",
@@ -269,8 +324,12 @@ impl JobRunner {
             contents.total_size
         );
 
-        // Chunk contents if needed
-        let strategy = ChunkingStrategy::default();
+        // Chunk contents based on the model's context limit.
+        // This prevents context_length_exceeded errors with smaller-context models.
+        // We use 80% of the model's limit to leave room for the prompt and response.
+        let model_context = self.state.llm.max_context_tokens();
+        let chunk_limit = (model_context as f64 * 0.8) as u32;
+        let strategy = ChunkingStrategy::with_max_tokens(chunk_limit);
         let chunks = chunk_contents(&contents.files, &strategy);
 
         tracing::info!("Split into {} chunk(s)", chunks.len());
@@ -322,12 +381,17 @@ impl JobRunner {
             ));
         }
 
-        // Update repo's last commit SHA BEFORE marking complete.
+        // Update repo's last commit SHA and last_checked_at BEFORE marking complete.
         // This ensures that if update_last_commit fails, the review is marked failed
         // (by the cleanup guard) and on retry we don't create a duplicate review
         // for the same commit.
-        repos::update_last_commit(&self.state.db, repo_id, &current_sha).await?;
-        reviews::mark_completed(&self.state.db, review.id, duration.as_secs() as u32).await?;
+        cleanup_guard
+            .check(repos::update_last_commit(&self.state.db, repo_id, &current_sha).await)?;
+        // Also update last_checked_at so the scheduler knows when we last checked this repo
+        cleanup_guard.check(repos::update_last_checked(&self.state.db, repo_id).await)?;
+        cleanup_guard.check(
+            reviews::mark_completed(&self.state.db, review.id, duration.as_secs() as u32).await,
+        )?;
 
         // Broadcast AFTER DB update to prevent race condition
         cleanup_guard.broadcast_complete();
@@ -471,24 +535,26 @@ impl JobRunner {
                 continue;
             }
 
-            // Check last review time - only count COMPLETED reviews as "recent".
-            // Failed reviews should not prevent scheduling a retry.
+            // Check if we've checked this repo recently (via last_checked_at).
+            // This covers both successful reviews AND "no changes" early-returns.
+            // Without this check, repos with no changes would be re-scheduled every poll.
+            if !repos::needs_check(&self.state.db, repo.id, review_interval_hours).await? {
+                continue;
+            }
+
+            // Also check the last review status - don't schedule if one is still running.
             let last_review = reviews::get_latest_for_repo(&self.state.db, repo.id).await?;
 
             let should_schedule = match last_review {
                 None => true, // Never reviewed
                 Some(review) => {
-                    // Only completed reviews count as "recent" for scheduling purposes.
-                    // Failed or in-progress reviews should not block scheduling.
                     match review.status {
-                        ReviewStatus::Completed { completed_at, .. } => {
-                            // Use completed_at (not created_at) so long-running reviews
-                            // don't shorten the effective interval.
-                            let hours_since = (Utc::now() - completed_at).num_hours();
-                            hours_since >= review_interval_hours
+                        ReviewStatus::Completed { .. } => {
+                            // Last review completed - needs_check already verified interval
+                            true
                         }
                         ReviewStatus::Failed { .. } => {
-                            // Failed review - allow immediate retry scheduling
+                            // Failed review - allow retry scheduling
                             true
                         }
                         ReviewStatus::Pending | ReviewStatus::InProgress { .. } => {

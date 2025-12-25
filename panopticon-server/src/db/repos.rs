@@ -13,6 +13,7 @@ struct RepoRow {
     #[allow(dead_code)]
     name: String,
     last_commit_sha: Option<String>,
+    last_checked_at: Option<String>,
     created_at: String,
 }
 
@@ -37,12 +38,18 @@ impl TryFrom<RepoRow> for Repo {
             Some(sha) => Some(CommitSha::parse(sha).ok_or("invalid commit SHA in database")?),
             None => None,
         };
+        let last_checked_at = row
+            .last_checked_at
+            .as_deref()
+            .map(parse_datetime)
+            .transpose()?;
         let created_at = parse_datetime(&row.created_at)?;
 
         Ok(Repo {
             id: RepoId::new(row.id),
             url,
             last_commit_sha,
+            last_checked_at,
             created_at,
         })
     }
@@ -58,7 +65,7 @@ pub async fn create(pool: &SqlitePool, new_repo: NewRepo) -> Result<Repo, sqlx::
         r#"
         INSERT INTO repos (url, owner, name)
         VALUES (?, ?, ?)
-        RETURNING id, url, owner, name, last_commit_sha, created_at
+        RETURNING id, url, owner, name, last_commit_sha, last_checked_at, created_at
         "#,
     )
     .bind(url)
@@ -75,7 +82,7 @@ pub async fn create(pool: &SqlitePool, new_repo: NewRepo) -> Result<Repo, sqlx::
 pub async fn get_by_id(pool: &SqlitePool, id: RepoId) -> Result<Option<Repo>, sqlx::Error> {
     let row = sqlx::query_as::<_, RepoRow>(
         r#"
-        SELECT id, url, owner, name, last_commit_sha, created_at
+        SELECT id, url, owner, name, last_commit_sha, last_checked_at, created_at
         FROM repos
         WHERE id = ?
         "#,
@@ -96,7 +103,7 @@ pub async fn get_by_id(pool: &SqlitePool, id: RepoId) -> Result<Option<Repo>, sq
 pub async fn list_all(pool: &SqlitePool) -> Result<Vec<Repo>, sqlx::Error> {
     let rows = sqlx::query_as::<_, RepoRow>(
         r#"
-        SELECT id, url, owner, name, last_commit_sha, created_at
+        SELECT id, url, owner, name, last_commit_sha, last_checked_at, created_at
         FROM repos
         ORDER BY created_at DESC
         "#,
@@ -143,6 +150,50 @@ pub async fn exists_by_url(pool: &SqlitePool, url: &GitHubRepoUrl) -> Result<boo
         .bind(url.as_str())
         .fetch_one(pool)
         .await?;
+
+    Ok(count > 0)
+}
+
+/// Update the last_checked_at timestamp to now.
+/// Call this after checking a repo for changes, even if no changes were found.
+pub async fn update_last_checked(pool: &SqlitePool, id: RepoId) -> Result<(), sqlx::Error> {
+    let now = chrono::Utc::now().to_rfc3339();
+    sqlx::query("UPDATE repos SET last_checked_at = ? WHERE id = ?")
+        .bind(&now)
+        .bind(id.into_inner())
+        .execute(pool)
+        .await?;
+
+    Ok(())
+}
+
+/// Check if a repository needs to be checked for updates.
+///
+/// Returns true if:
+/// - The repo has never been checked (last_checked_at is NULL), OR
+/// - More than `interval_hours` have passed since the last check
+///
+/// This is used by the scheduler to determine if a new review job should be created.
+pub async fn needs_check(
+    pool: &SqlitePool,
+    id: RepoId,
+    interval_hours: i64,
+) -> Result<bool, sqlx::Error> {
+    // Check if last_checked_at is null or older than interval_hours
+    let count: i64 = sqlx::query_scalar(
+        r#"
+        SELECT COUNT(*) FROM repos
+        WHERE id = ?
+          AND (
+            last_checked_at IS NULL
+            OR datetime(last_checked_at) < datetime('now', ? || ' hours')
+          )
+        "#,
+    )
+    .bind(id.into_inner())
+    .bind(-interval_hours) // negative because we want "X hours ago"
+    .fetch_one(pool)
+    .await?;
 
     Ok(count > 0)
 }
