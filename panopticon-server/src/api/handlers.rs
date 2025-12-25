@@ -46,7 +46,9 @@ pub struct CreateRepoRequest {
     pub url: String,
 }
 
-pub async fn list_repos(State(state): State<AppState>) -> Result<Json<Vec<RepoResponse>>, ApiError> {
+pub async fn list_repos(
+    State(state): State<AppState>,
+) -> Result<Json<Vec<RepoResponse>>, ApiError> {
     let repos_list = repos::list_all(&state.db).await?;
     let mut responses = Vec::new();
 
@@ -90,14 +92,16 @@ pub async fn create_repo(
 
     // Check if already exists
     if repos::exists_by_url(&state.db, &url).await? {
-        return Err(ApiError::Conflict("Repository already registered".to_string()));
+        return Err(ApiError::Conflict(
+            "Repository already registered".to_string(),
+        ));
     }
 
     let repo = repos::create(&state.db, NewRepo { url }).await?;
 
     // Create default prompt
-    let default_prompt_text = PromptText::new(DEFAULT_REVIEW_PROMPT.to_string())
-        .expect("Default prompt should be valid");
+    let default_prompt_text =
+        PromptText::new(DEFAULT_REVIEW_PROMPT.to_string()).expect("Default prompt should be valid");
 
     prompts::create(
         &state.db,
@@ -280,6 +284,11 @@ pub async fn update_prompt(
         .await?
         .ok_or_else(|| ApiError::NotFound("Repository not found".to_string()))?;
 
+    // Verify prompt exists AND belongs to this repo (ownership check)
+    prompts::get_by_id_and_repo(&state.db, prompt_id, repo_id)
+        .await?
+        .ok_or_else(|| ApiError::NotFound("Prompt not found".to_string()))?;
+
     let text = PromptText::new(req.text)
         .ok_or_else(|| ApiError::BadRequest("Prompt text cannot be empty".to_string()))?;
 
@@ -314,13 +323,16 @@ pub async fn delete_prompt(
         .await?
         .ok_or_else(|| ApiError::NotFound("Repository not found".to_string()))?;
 
-    // Check if it's a default prompt
-    if let Some(prompt) = prompts::get_by_id(&state.db, prompt_id).await? {
-        if prompt.is_default {
-            return Err(ApiError::BadRequest(
-                "Cannot delete default prompt".to_string(),
-            ));
-        }
+    // Verify prompt exists AND belongs to this repo (ownership check)
+    // Also check if it's a default prompt
+    let prompt = prompts::get_by_id_and_repo(&state.db, prompt_id, repo_id)
+        .await?
+        .ok_or_else(|| ApiError::NotFound("Prompt not found".to_string()))?;
+
+    if prompt.is_default {
+        return Err(ApiError::BadRequest(
+            "Cannot delete default prompt".to_string(),
+        ));
     }
 
     let deleted = prompts::delete(&state.db, prompt_id).await?;
@@ -435,8 +447,9 @@ pub async fn get_review(
                 prompt_id: r.prompt_id.into_inner(),
                 prompt_name: r.prompt_name,
                 action_required: r.output.action_required,
-                user_visible_comments: r.output.user_visible_comments,
-                detailed_reasoning: r.output.detailed_reasoning,
+                // Use as_raw() - content is sent as JSON (safe), frontend must escape for HTML
+                user_visible_comments: r.output.user_visible_comments.as_raw().to_string(),
+                detailed_reasoning: r.output.detailed_reasoning.as_raw().to_string(),
             })
             .collect(),
         created_at: review.created_at.to_rfc3339(),

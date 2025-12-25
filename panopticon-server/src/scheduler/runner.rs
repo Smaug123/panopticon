@@ -14,6 +14,7 @@ use crate::llm::provider::LlmRequest;
 use crate::llm::schema::build_system_prompt;
 use crate::AppState;
 use crate::ReviewUpdate;
+use crate::ReviewUpdateKind;
 
 /// Background job runner that processes the job queue.
 pub struct JobRunner {
@@ -79,9 +80,7 @@ impl JobRunner {
 
     async fn execute_job(&self, job: Job) {
         let result = match &job.payload {
-            JobPayload::ReviewRepo { repo_id, force } => {
-                self.run_review(*repo_id, *force).await
-            }
+            JobPayload::ReviewRepo { repo_id, force } => self.run_review(*repo_id, *force).await,
         };
 
         match result {
@@ -108,7 +107,11 @@ impl JobRunner {
             .await?
             .ok_or_else(|| anyhow::anyhow!("Repo not found"))?;
 
-        tracing::info!("Running review for {}/{}", repo.url.owner(), repo.url.name());
+        tracing::info!(
+            "Running review for {}/{}",
+            repo.url.owner(),
+            repo.url.name()
+        );
 
         // Fetch/update repo and get current SHA
         let current_sha = self.state.github.fetch(&repo.url).await?;
@@ -171,10 +174,7 @@ impl JobRunner {
         for prompt in &prompts_list {
             tracing::info!("Running prompt: {}", prompt.name);
 
-            match self
-                .run_prompt_review(review.id, &prompt, &chunks)
-                .await
-            {
+            match self.run_prompt_review(review.id, &prompt, &chunks).await {
                 Ok(output) => {
                     // Store result
                     if let Err(e) = reviews::add_result(
@@ -207,10 +207,14 @@ impl JobRunner {
             repos::update_last_commit(&self.state.db, repo_id, &current_sha).await?;
         }
 
-        tracing::info!(
-            "Review completed in {:.1}s",
-            duration.as_secs_f64()
-        );
+        // Send review complete event to close SSE streams
+        let _ = self.state.review_updates.send(ReviewUpdate {
+            review_id: review.id,
+            prompt_name: String::new(),
+            kind: ReviewUpdateKind::ReviewComplete,
+        });
+
+        tracing::info!("Review completed in {:.1}s", duration.as_secs_f64());
 
         Ok(())
     }
@@ -236,7 +240,9 @@ impl JobRunner {
                 max_tokens: 16_000,
             };
 
-            return self.run_llm_streaming(review_id, &prompt.name, request).await;
+            return self
+                .run_llm_streaming(review_id, &prompt.name, request)
+                .await;
         }
 
         // Multiple chunks: review each and aggregate
@@ -262,16 +268,26 @@ impl JobRunner {
                 .run_llm_streaming(review_id, &prompt.name, request)
                 .await?;
 
-            all_reasoning.push(format!("## Part {}\n{}", i + 1, output.detailed_reasoning));
+            // Use as_raw() to get the content for aggregation
+            all_reasoning.push(format!(
+                "## Part {}\n{}",
+                i + 1,
+                output.detailed_reasoning.as_raw()
+            ));
             any_action_required |= output.action_required;
-            all_comments.push(format!("## Part {}\n{}", i + 1, output.user_visible_comments));
+            all_comments.push(format!(
+                "## Part {}\n{}",
+                i + 1,
+                output.user_visible_comments.as_raw()
+            ));
         }
 
-        // Combine results
+        // Combine results - wrap in UntrustedString since content is from LLM
+        use crate::domain::untrusted::UntrustedString;
         Ok(ReviewOutput {
-            detailed_reasoning: all_reasoning.join("\n\n"),
+            detailed_reasoning: UntrustedString::from(all_reasoning.join("\n\n")),
             action_required: any_action_required,
-            user_visible_comments: all_comments.join("\n\n"),
+            user_visible_comments: UntrustedString::from(all_comments.join("\n\n")),
         })
     }
 
@@ -288,14 +304,22 @@ impl JobRunner {
             let chunk = chunk_result?;
             full_text.push_str(&chunk.text);
 
-            // Broadcast update for SSE clients
-            let _ = self.state.review_updates.send(ReviewUpdate {
-                review_id,
-                prompt_name: prompt_name.to_string(),
-                chunk: chunk.text,
-                is_final: chunk.is_final,
-            });
+            // Broadcast chunk updates for SSE clients (only if there's text)
+            if !chunk.text.is_empty() {
+                let _ = self.state.review_updates.send(ReviewUpdate {
+                    review_id,
+                    prompt_name: prompt_name.to_string(),
+                    kind: ReviewUpdateKind::Chunk { text: chunk.text },
+                });
+            }
         }
+
+        // Send prompt complete event (the entire review may have more prompts)
+        let _ = self.state.review_updates.send(ReviewUpdate {
+            review_id,
+            prompt_name: prompt_name.to_string(),
+            kind: ReviewUpdateKind::PromptComplete,
+        });
 
         crate::llm::schema::parse_review_output(&full_text)
             .map_err(|e| anyhow::anyhow!("Failed to parse LLM response: {}", e))

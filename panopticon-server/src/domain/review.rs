@@ -1,5 +1,6 @@
 use crate::domain::ids::{PromptId, RepoId, ReviewId};
 use crate::domain::repo::CommitSha;
+use crate::domain::untrusted::UntrustedString;
 
 /// How the review was triggered - discriminated union, no invalid combinations.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -60,14 +61,19 @@ impl ReviewStatus {
 }
 
 /// Structured output from the LLM for a single prompt.
+///
+/// All string fields use `UntrustedString` because LLM output is untrusted
+/// and must be sanitized before display to prevent XSS attacks.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ReviewOutput {
     /// Internal reasoning (stored but not displayed by default).
-    pub detailed_reasoning: String,
+    /// Uses UntrustedString because it comes from the LLM.
+    pub detailed_reasoning: UntrustedString,
     /// Flag indicating whether action is required.
     pub action_required: bool,
     /// User-facing comments in markdown format.
-    pub user_visible_comments: String,
+    /// Uses UntrustedString because it comes from the LLM.
+    pub user_visible_comments: UntrustedString,
 }
 
 /// A single prompt's result within a review.

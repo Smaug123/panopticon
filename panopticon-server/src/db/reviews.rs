@@ -5,6 +5,7 @@ use crate::domain::repo::CommitSha;
 use crate::domain::review::{
     NewReview, PromptResult, Review, ReviewOutput, ReviewStatus, ReviewTrigger,
 };
+use crate::domain::untrusted::UntrustedString;
 
 /// Database row for reviews table.
 #[derive(sqlx::FromRow)]
@@ -36,8 +37,14 @@ struct ReviewResultRow {
 }
 
 fn parse_datetime(s: &str) -> Result<chrono::DateTime<chrono::Utc>, &'static str> {
-    chrono::DateTime::parse_from_rfc3339(s)
-        .map(|dt| dt.with_timezone(&chrono::Utc))
+    // Try RFC3339 first (preferred format)
+    if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(s) {
+        return Ok(dt.with_timezone(&chrono::Utc));
+    }
+
+    // Fall back to SQLite's datetime('now') format: "YYYY-MM-DD HH:MM:SS"
+    chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S")
+        .map(|naive| naive.and_utc())
         .map_err(|_| "invalid date")
 }
 
@@ -98,9 +105,10 @@ impl TryFrom<(ReviewRow, Vec<ReviewResultRow>)> for Review {
                 prompt_id: PromptId::new(r.prompt_id),
                 prompt_name: r.prompt_name,
                 output: ReviewOutput {
-                    detailed_reasoning: r.detailed_reasoning,
+                    // Wrap database strings in UntrustedString as they came from LLM
+                    detailed_reasoning: UntrustedString::from(r.detailed_reasoning),
                     action_required: r.action_required,
-                    user_visible_comments: r.user_visible_comments,
+                    user_visible_comments: UntrustedString::from(r.user_visible_comments),
                 },
             })
             .collect();
@@ -166,11 +174,9 @@ pub async fn get_by_id(pool: &SqlitePool, id: ReviewId) -> Result<Option<Review>
     .fetch_all(pool)
     .await?;
 
-    Ok(Some(
-        (row, results)
-            .try_into()
-            .map_err(|e| sqlx::Error::Decode(Box::new(std::io::Error::other(e))))?,
-    ))
+    Ok(Some((row, results).try_into().map_err(|e| {
+        sqlx::Error::Decode(Box::new(std::io::Error::other(e)))
+    })?))
 }
 
 /// List reviews for a repository (without results for efficiency).
@@ -215,24 +221,24 @@ pub async fn get_latest_for_repo(
     .await?;
 
     match row {
-        Some(r) => Ok(Some(
-            (r, vec![])
-                .try_into()
-                .map_err(|e| sqlx::Error::Decode(Box::new(std::io::Error::other(e))))?,
-        )),
+        Some(r) => Ok(Some((r, vec![]).try_into().map_err(|e| {
+            sqlx::Error::Decode(Box::new(std::io::Error::other(e)))
+        })?)),
         None => Ok(None),
     }
 }
 
 /// Mark a review as in progress.
 pub async fn mark_in_progress(pool: &SqlitePool, id: ReviewId) -> Result<(), sqlx::Error> {
+    let now = chrono::Utc::now().to_rfc3339();
     sqlx::query(
         r#"
         UPDATE reviews
-        SET status = 'in_progress', started_at = datetime('now')
+        SET status = 'in_progress', started_at = ?
         WHERE id = ?
         "#,
     )
+    .bind(&now)
     .bind(id.into_inner())
     .execute(pool)
     .await?;
@@ -246,13 +252,15 @@ pub async fn mark_completed(
     id: ReviewId,
     duration_secs: u32,
 ) -> Result<(), sqlx::Error> {
+    let now = chrono::Utc::now().to_rfc3339();
     sqlx::query(
         r#"
         UPDATE reviews
-        SET status = 'completed', completed_at = datetime('now'), duration_secs = ?
+        SET status = 'completed', completed_at = ?, duration_secs = ?
         WHERE id = ?
         "#,
     )
+    .bind(&now)
     .bind(duration_secs as i64)
     .bind(id.into_inner())
     .execute(pool)
@@ -262,18 +270,16 @@ pub async fn mark_completed(
 }
 
 /// Mark a review as failed.
-pub async fn mark_failed(
-    pool: &SqlitePool,
-    id: ReviewId,
-    error: &str,
-) -> Result<(), sqlx::Error> {
+pub async fn mark_failed(pool: &SqlitePool, id: ReviewId, error: &str) -> Result<(), sqlx::Error> {
+    let now = chrono::Utc::now().to_rfc3339();
     sqlx::query(
         r#"
         UPDATE reviews
-        SET status = 'failed', completed_at = datetime('now'), error = ?
+        SET status = 'failed', completed_at = ?, error = ?
         WHERE id = ?
         "#,
     )
+    .bind(&now)
     .bind(error)
     .bind(id.into_inner())
     .execute(pool)
@@ -299,9 +305,11 @@ pub async fn add_result(
     .bind(review_id.into_inner())
     .bind(prompt_id.into_inner())
     .bind(prompt_name)
-    .bind(&output.detailed_reasoning)
+    // Use as_raw() to store the raw string - it will be wrapped back in
+    // UntrustedString when read, ensuring it's still treated as untrusted
+    .bind(output.detailed_reasoning.as_raw())
     .bind(output.action_required)
-    .bind(&output.user_visible_comments)
+    .bind(output.user_visible_comments.as_raw())
     .execute(pool)
     .await?;
 

@@ -77,6 +77,8 @@ struct ResponsesRequest {
     input: Vec<ResponsesInputMessage>,
     reasoning: ReasoningConfig,
     text: TextFormat,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_output_tokens: Option<u32>,
     stream: bool,
 }
 
@@ -140,6 +142,8 @@ impl LlmProvider for OpenAiProvider {
                         strict: true,
                     },
                 },
+                // Include max_output_tokens to control output length and prevent budget overruns
+                max_output_tokens: Some(request.max_tokens),
                 stream: true,
             };
 

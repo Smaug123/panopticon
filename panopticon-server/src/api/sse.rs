@@ -13,6 +13,7 @@ use crate::db::reviews;
 use crate::domain::ids::ReviewId;
 use crate::domain::review::ReviewStatus;
 use crate::AppState;
+use crate::ReviewUpdateKind;
 
 type SseStream = Pin<Box<dyn Stream<Item = Result<Event, Infallible>> + Send>>;
 
@@ -47,26 +48,28 @@ pub async fn review_stream(
 
     // Subscribe to updates
     let rx = state.review_updates.subscribe();
-    let stream: SseStream = Box::pin(
-        BroadcastStream::new(rx).filter_map(move |result| match result {
+    let stream: SseStream = Box::pin(BroadcastStream::new(rx).filter_map(
+        move |result| match result {
             Ok(update) if update.review_id == review_id => {
-                let data = if update.is_final {
-                    serde_json::json!({
-                        "type": "prompt_complete",
-                        "prompt_name": update.prompt_name,
-                    })
-                } else {
-                    serde_json::json!({
+                let data = match update.kind {
+                    ReviewUpdateKind::Chunk { text } => serde_json::json!({
                         "type": "chunk",
                         "prompt_name": update.prompt_name,
-                        "text": update.chunk,
-                    })
+                        "text": text,
+                    }),
+                    ReviewUpdateKind::PromptComplete => serde_json::json!({
+                        "type": "prompt_complete",
+                        "prompt_name": update.prompt_name,
+                    }),
+                    ReviewUpdateKind::ReviewComplete => serde_json::json!({
+                        "type": "complete",
+                    }),
                 };
                 Some(Ok::<_, Infallible>(Event::default().data(data.to_string())))
             }
             _ => None,
-        }),
-    );
+        },
+    ));
 
     Ok(Sse::new(stream).keep_alive(
         axum::response::sse::KeepAlive::new()

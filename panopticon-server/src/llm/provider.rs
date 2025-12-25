@@ -78,7 +78,8 @@ pub trait LlmProvider: Send + Sync {
     fn complete_structured(
         &self,
         request: LlmRequest,
-    ) -> Pin<Box<dyn std::future::Future<Output = Result<ReviewOutput, LlmError>> + Send + '_>> {
+    ) -> Pin<Box<dyn std::future::Future<Output = Result<ReviewOutput, LlmError>> + Send + '_>>
+    {
         Box::pin(async move {
             use futures::StreamExt;
 

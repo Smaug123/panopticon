@@ -62,9 +62,9 @@ pub fn chunk_contents(files: &[FileContent], strategy: &ChunkingStrategy) -> Vec
                 content,
             }]
         }
-        ChunkingStrategy::ByFile { max_tokens_per_chunk } => {
-            chunk_by_file(files, *max_tokens_per_chunk)
-        }
+        ChunkingStrategy::ByFile {
+            max_tokens_per_chunk,
+        } => chunk_by_file(files, *max_tokens_per_chunk),
     }
 }
 

@@ -3,3 +3,4 @@ pub mod job;
 pub mod prompt;
 pub mod repo;
 pub mod review;
+pub mod untrusted;

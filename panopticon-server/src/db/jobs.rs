@@ -20,8 +20,14 @@ struct JobRow {
 }
 
 fn parse_datetime(s: &str) -> Result<DateTime<Utc>, &'static str> {
-    chrono::DateTime::parse_from_rfc3339(s)
-        .map(|dt| dt.with_timezone(&Utc))
+    // Try RFC3339 first (preferred format)
+    if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(s) {
+        return Ok(dt.with_timezone(&Utc));
+    }
+
+    // Fall back to SQLite's datetime('now') format: "YYYY-MM-DD HH:MM:SS"
+    chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S")
+        .map(|naive| naive.and_utc())
         .map_err(|_| "invalid date")
 }
 
@@ -33,11 +39,7 @@ impl TryFrom<JobRow> for Job {
             serde_json::from_str(&row.payload).map_err(|_| "invalid job payload")?;
         let status = JobStatus::from_str(&row.status).ok_or("invalid job status")?;
         let scheduled_at = parse_datetime(&row.scheduled_at)?;
-        let started_at = row
-            .started_at
-            .as_deref()
-            .map(parse_datetime)
-            .transpose()?;
+        let started_at = row.started_at.as_deref().map(parse_datetime).transpose()?;
         let completed_at = row
             .completed_at
             .as_deref()
@@ -62,8 +64,8 @@ impl TryFrom<JobRow> for Job {
 
 /// Create a new job.
 pub async fn create(pool: &SqlitePool, new_job: NewJob) -> Result<Job, sqlx::Error> {
-    let payload = serde_json::to_string(&new_job.payload)
-        .map_err(|e| sqlx::Error::Encode(Box::new(e)))?;
+    let payload =
+        serde_json::to_string(&new_job.payload).map_err(|e| sqlx::Error::Encode(Box::new(e)))?;
     let scheduled_at = new_job.scheduled_at.to_rfc3339();
 
     let row = sqlx::query_as::<_, JobRow>(
@@ -86,43 +88,47 @@ pub async fn create(pool: &SqlitePool, new_job: NewJob) -> Result<Job, sqlx::Err
 /// Atomically claim the next available job.
 /// Uses UPDATE...RETURNING to prevent race conditions.
 pub async fn claim_next(pool: &SqlitePool) -> Result<Option<Job>, sqlx::Error> {
+    let now = Utc::now().to_rfc3339();
     let row = sqlx::query_as::<_, JobRow>(
         r#"
         UPDATE jobs
         SET status = 'running',
-            started_at = datetime('now'),
+            started_at = ?,
             attempts = attempts + 1
         WHERE id = (
             SELECT id FROM jobs
             WHERE status = 'pending'
-              AND scheduled_at <= datetime('now')
+              AND scheduled_at <= ?
             ORDER BY scheduled_at ASC
             LIMIT 1
         )
         RETURNING id, payload, status, attempts, max_attempts, scheduled_at, started_at, completed_at, last_error, created_at
         "#,
     )
+    .bind(&now)
+    .bind(&now)
     .fetch_optional(pool)
     .await?;
 
     match row {
-        Some(r) => Ok(Some(
-            r.try_into()
-                .map_err(|e| sqlx::Error::Decode(Box::new(std::io::Error::other(e))))?,
-        )),
+        Some(r) => Ok(Some(r.try_into().map_err(|e| {
+            sqlx::Error::Decode(Box::new(std::io::Error::other(e)))
+        })?)),
         None => Ok(None),
     }
 }
 
 /// Mark a job as completed.
 pub async fn complete(pool: &SqlitePool, id: JobId) -> Result<(), sqlx::Error> {
+    let now = Utc::now().to_rfc3339();
     sqlx::query(
         r#"
         UPDATE jobs
-        SET status = 'completed', completed_at = datetime('now')
+        SET status = 'completed', completed_at = ?
         WHERE id = ?
         "#,
     )
+    .bind(&now)
     .bind(id.into_inner())
     .execute(pool)
     .await?;
@@ -138,6 +144,7 @@ pub async fn fail(
     error: &str,
     should_retry: bool,
 ) -> Result<(), sqlx::Error> {
+    let now = Utc::now().to_rfc3339();
     if should_retry {
         // Set back to pending for retry
         sqlx::query(
@@ -149,13 +156,14 @@ pub async fn fail(
                 END,
                 last_error = ?,
                 completed_at = CASE
-                    WHEN attempts >= max_attempts THEN datetime('now')
+                    WHEN attempts >= max_attempts THEN ?
                     ELSE NULL
                 END
             WHERE id = ?
             "#,
         )
         .bind(error)
+        .bind(&now)
         .bind(id.into_inner())
         .execute(pool)
         .await?;
@@ -163,10 +171,11 @@ pub async fn fail(
         sqlx::query(
             r#"
             UPDATE jobs
-            SET status = 'failed', completed_at = datetime('now'), last_error = ?
+            SET status = 'failed', completed_at = ?, last_error = ?
             WHERE id = ?
             "#,
         )
+        .bind(&now)
         .bind(error)
         .bind(id.into_inner())
         .execute(pool)
@@ -178,17 +187,17 @@ pub async fn fail(
 
 /// Check if there's already a pending review job for a repo.
 pub async fn has_pending_review(pool: &SqlitePool, repo_id: RepoId) -> Result<bool, sqlx::Error> {
-    let payload_pattern = format!(r#"%"repo_id":{}%"#, repo_id.into_inner());
-
+    // Use json_extract for exact matching instead of LIKE pattern matching.
+    // LIKE '%"repo_id":1%' would incorrectly match repo_id 10, 100, etc.
     let count: i64 = sqlx::query_scalar(
         r#"
         SELECT COUNT(*) FROM jobs
         WHERE status IN ('pending', 'running')
-          AND payload LIKE ?
-          AND payload LIKE '%"type":"review_repo"%'
+          AND json_extract(payload, '$.type') = 'review_repo'
+          AND json_extract(payload, '$.repo_id') = ?
         "#,
     )
-    .bind(&payload_pattern)
+    .bind(repo_id.into_inner())
     .fetch_one(pool)
     .await?;
 
@@ -206,14 +215,16 @@ pub async fn count_pending(pool: &SqlitePool) -> Result<i64, sqlx::Error> {
 
 /// Clean up old completed/failed jobs (keep last N days).
 pub async fn cleanup_old(pool: &SqlitePool, days: i64) -> Result<u64, sqlx::Error> {
+    // Calculate the cutoff date in RFC3339 format
+    let cutoff = (Utc::now() - chrono::Duration::days(days)).to_rfc3339();
     let result = sqlx::query(
         r#"
         DELETE FROM jobs
         WHERE status IN ('completed', 'failed')
-          AND completed_at < datetime('now', ? || ' days')
+          AND completed_at < ?
         "#,
     )
-    .bind(-days)
+    .bind(&cutoff)
     .execute(pool)
     .await?;
 

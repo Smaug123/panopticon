@@ -16,6 +16,18 @@ struct RepoRow {
     created_at: String,
 }
 
+fn parse_datetime(s: &str) -> Result<chrono::DateTime<chrono::Utc>, &'static str> {
+    // Try RFC3339 first (preferred format)
+    if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(s) {
+        return Ok(dt.with_timezone(&chrono::Utc));
+    }
+
+    // Fall back to SQLite's datetime('now') format: "YYYY-MM-DD HH:MM:SS"
+    chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S")
+        .map(|naive| naive.and_utc())
+        .map_err(|_| "invalid date")
+}
+
 impl TryFrom<RepoRow> for Repo {
     type Error = &'static str;
 
@@ -25,14 +37,13 @@ impl TryFrom<RepoRow> for Repo {
             Some(sha) => Some(CommitSha::parse(sha).ok_or("invalid commit SHA in database")?),
             None => None,
         };
-        let created_at =
-            chrono::DateTime::parse_from_rfc3339(&row.created_at).map_err(|_| "invalid date")?;
+        let created_at = parse_datetime(&row.created_at)?;
 
         Ok(Repo {
             id: RepoId::new(row.id),
             url,
             last_commit_sha,
-            created_at: created_at.with_timezone(&chrono::Utc),
+            created_at,
         })
     }
 }
@@ -74,10 +85,9 @@ pub async fn get_by_id(pool: &SqlitePool, id: RepoId) -> Result<Option<Repo>, sq
     .await?;
 
     match row {
-        Some(r) => Ok(Some(
-            r.try_into()
-                .map_err(|e| sqlx::Error::Decode(Box::new(std::io::Error::other(e))))?,
-        )),
+        Some(r) => Ok(Some(r.try_into().map_err(|e| {
+            sqlx::Error::Decode(Box::new(std::io::Error::other(e)))
+        })?)),
         None => Ok(None),
     }
 }

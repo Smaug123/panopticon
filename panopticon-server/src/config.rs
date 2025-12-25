@@ -5,11 +5,15 @@ use serde::Deserialize;
 
 #[derive(Debug, Deserialize)]
 pub struct AppConfig {
+    #[serde(default)]
     pub server: ServerConfig,
+    #[serde(default)]
     pub database: DatabaseConfig,
     pub llm: LlmConfig,
+    #[serde(default)]
     pub github: GitHubConfig,
     pub auth: AuthConfig,
+    #[serde(default)]
     pub scheduler: SchedulerConfig,
 }
 
@@ -142,6 +146,11 @@ impl AppConfig {
     /// 2. config.toml in current directory
     /// 3. /etc/panopticon/config.toml
     /// 4. Default values
+    ///
+    /// Environment variable format uses double underscore as separator:
+    /// - PANOPTICON__SERVER__PORT=8080 -> server.port = 8080
+    /// - PANOPTICON__LLM__PROVIDER__API_KEY=sk-... -> llm.provider.api_key
+    /// - PANOPTICON__LLM__PROVIDER__TYPE=open_ai -> llm.provider.type = "open_ai"
     pub fn load() -> Result<Self, config::ConfigError> {
         let config = Config::builder()
             // Load from /etc/panopticon/config.toml if exists
@@ -149,11 +158,10 @@ impl AppConfig {
             // Load from config.toml in current directory if exists
             .add_source(File::with_name("config").required(false))
             // Override with environment variables
-            // PANOPTICON_SERVER_PORT=8080 -> server.port = 8080
-            // PANOPTICON_LLM_PROVIDER_API_KEY=sk-... -> llm.provider.api_key
+            // Use double underscore as separator to allow single underscores in keys
             .add_source(
                 Environment::with_prefix("PANOPTICON")
-                    .separator("_")
+                    .separator("__")
                     .try_parsing(true),
             )
             .build()?;
@@ -167,7 +175,7 @@ impl AppConfig {
             .add_source(File::with_name(path))
             .add_source(
                 Environment::with_prefix("PANOPTICON")
-                    .separator("_")
+                    .separator("__")
                     .try_parsing(true),
             )
             .build()?;

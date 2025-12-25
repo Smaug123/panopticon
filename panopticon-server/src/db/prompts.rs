@@ -15,13 +15,24 @@ struct PromptRow {
     created_at: String,
 }
 
+fn parse_datetime(s: &str) -> Result<chrono::DateTime<chrono::Utc>, &'static str> {
+    // Try RFC3339 first (preferred format)
+    if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(s) {
+        return Ok(dt.with_timezone(&chrono::Utc));
+    }
+
+    // Fall back to SQLite's datetime('now') format: "YYYY-MM-DD HH:MM:SS"
+    chrono::NaiveDateTime::parse_from_str(s, "%Y-%m-%d %H:%M:%S")
+        .map(|naive| naive.and_utc())
+        .map_err(|_| "invalid date")
+}
+
 impl TryFrom<PromptRow> for Prompt {
     type Error = &'static str;
 
     fn try_from(row: PromptRow) -> Result<Self, Self::Error> {
         let text = PromptText::new(row.text).ok_or("empty prompt text in database")?;
-        let created_at =
-            chrono::DateTime::parse_from_rfc3339(&row.created_at).map_err(|_| "invalid date")?;
+        let created_at = parse_datetime(&row.created_at)?;
 
         Ok(Prompt {
             id: PromptId::new(row.id),
@@ -30,7 +41,7 @@ impl TryFrom<PromptRow> for Prompt {
             text,
             enabled: row.enabled,
             is_default: row.is_default,
-            created_at: created_at.with_timezone(&chrono::Utc),
+            created_at,
         })
     }
 }
@@ -69,10 +80,38 @@ pub async fn get_by_id(pool: &SqlitePool, id: PromptId) -> Result<Option<Prompt>
     .await?;
 
     match row {
-        Some(r) => Ok(Some(
-            r.try_into()
-                .map_err(|e| sqlx::Error::Decode(Box::new(std::io::Error::other(e))))?,
-        )),
+        Some(r) => Ok(Some(r.try_into().map_err(|e| {
+            sqlx::Error::Decode(Box::new(std::io::Error::other(e)))
+        })?)),
+        None => Ok(None),
+    }
+}
+
+/// Get a prompt by ID and verify it belongs to the specified repo.
+///
+/// Returns None if the prompt doesn't exist OR if it belongs to a different repo.
+/// This prevents unauthorized access to prompts from other repositories.
+pub async fn get_by_id_and_repo(
+    pool: &SqlitePool,
+    id: PromptId,
+    repo_id: RepoId,
+) -> Result<Option<Prompt>, sqlx::Error> {
+    let row = sqlx::query_as::<_, PromptRow>(
+        r#"
+        SELECT id, repo_id, name, text, enabled, is_default, created_at
+        FROM prompts
+        WHERE id = ? AND repo_id = ?
+        "#,
+    )
+    .bind(id.into_inner())
+    .bind(repo_id.into_inner())
+    .fetch_optional(pool)
+    .await?;
+
+    match row {
+        Some(r) => Ok(Some(r.try_into().map_err(|e| {
+            sqlx::Error::Decode(Box::new(std::io::Error::other(e)))
+        })?)),
         None => Ok(None),
     }
 }

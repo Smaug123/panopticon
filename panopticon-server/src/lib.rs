@@ -13,13 +13,23 @@ use tokio::sync::broadcast;
 pub use config::AppConfig;
 use domain::ids::ReviewId;
 
+/// Type of update event for SSE streaming.
+#[derive(Clone, Debug)]
+pub enum ReviewUpdateKind {
+    /// A chunk of streaming text from the LLM.
+    Chunk { text: String },
+    /// A single prompt has completed (but review may continue with more prompts).
+    PromptComplete,
+    /// The entire review has completed (all prompts done).
+    ReviewComplete,
+}
+
 /// Broadcast channel message for streaming review updates to connected clients.
 #[derive(Clone, Debug)]
 pub struct ReviewUpdate {
     pub review_id: ReviewId,
     pub prompt_name: String,
-    pub chunk: String,
-    pub is_final: bool,
+    pub kind: ReviewUpdateKind,
 }
 
 /// Shared application state passed to all handlers.

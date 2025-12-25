@@ -163,14 +163,21 @@ impl GitHubFetcher {
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(FetchError::GitError(format!("rev-parse failed: {}", stderr)));
+            return Err(FetchError::GitError(format!(
+                "rev-parse failed: {}",
+                stderr
+            )));
         }
 
         let sha = String::from_utf8_lossy(&output.stdout).trim().to_string();
         CommitSha::parse(&sha).ok_or(FetchError::InvalidSha(sha))
     }
 
-    async fn list_files(&self, repo_path: &Path, filter: &FileFilter) -> Result<Vec<PathBuf>, FetchError> {
+    async fn list_files(
+        &self,
+        repo_path: &Path,
+        filter: &FileFilter,
+    ) -> Result<Vec<PathBuf>, FetchError> {
         let mut files = Vec::new();
         let mut stack = vec![repo_path.to_path_buf()];
 

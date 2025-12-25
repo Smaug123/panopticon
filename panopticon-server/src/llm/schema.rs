@@ -104,9 +104,12 @@ mod tests {
         }"#;
 
         let output = parse_review_output(json).unwrap();
-        assert_eq!(output.detailed_reasoning, "The code looks good overall.");
+        assert_eq!(
+            output.detailed_reasoning.as_raw(),
+            "The code looks good overall."
+        );
         assert!(!output.action_required);
-        assert_eq!(output.user_visible_comments, "No issues found.");
+        assert_eq!(output.user_visible_comments.as_raw(), "No issues found.");
     }
 
     #[test]

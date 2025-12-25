@@ -66,12 +66,16 @@ function escapeHtml(text) {
     return div.innerHTML;
 }
 
-// Simple markdown to HTML conversion
+// Simple markdown to HTML conversion with XSS protection.
+// IMPORTANT: Content from LLM is untrusted and must be escaped before rendering.
 function renderMarkdown(text) {
     if (!text) return '';
 
-    return text
-        // Code blocks
+    // SECURITY: First escape all HTML to prevent XSS from LLM output
+    const escaped = escapeHtml(text);
+
+    return escaped
+        // Code blocks - use escaped content
         .replace(/```(\w*)\n([\s\S]*?)```/g, '<pre><code>$2</code></pre>')
         // Inline code
         .replace(/`([^`]+)`/g, '<code>$1</code>')
@@ -516,8 +520,11 @@ function startReviewStream(reviewId) {
                     </div>
                 </div>
             `).join('');
-        } else if (data.type === 'complete' || data.type === 'prompt_complete') {
-            // Refresh to get final results
+        } else if (data.type === 'prompt_complete') {
+            // A single prompt finished, but there may be more prompts.
+            // Keep the stream open and continue receiving updates.
+        } else if (data.type === 'complete') {
+            // All prompts completed - refresh to get final results
             eventSource.close();
             showReviewDetail(reviewId);
         }
