@@ -1,4 +1,4 @@
-use sqlx::SqlitePool;
+use sqlx::{Executor, Sqlite, SqlitePool};
 
 use crate::domain::ids::RepoId;
 use crate::domain::repo::{CommitSha, GitHubRepoUrl, NewRepo, Repo};
@@ -56,7 +56,12 @@ impl TryFrom<RepoRow> for Repo {
 }
 
 /// Create a new repository.
-pub async fn create(pool: &SqlitePool, new_repo: NewRepo) -> Result<Repo, sqlx::Error> {
+///
+/// Accepts any executor (pool or transaction) for transactional safety.
+pub async fn create<'e, E>(executor: E, new_repo: NewRepo) -> Result<Repo, sqlx::Error>
+where
+    E: Executor<'e, Database = Sqlite>,
+{
     let url = new_repo.url.as_str();
     let owner = new_repo.url.owner();
     let name = new_repo.url.name();
@@ -71,7 +76,7 @@ pub async fn create(pool: &SqlitePool, new_repo: NewRepo) -> Result<Repo, sqlx::
     .bind(url)
     .bind(owner)
     .bind(name)
-    .fetch_one(pool)
+    .fetch_one(executor)
     .await?;
 
     row.try_into()

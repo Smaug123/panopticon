@@ -1,4 +1,4 @@
-use sqlx::SqlitePool;
+use sqlx::{Executor, Sqlite, SqlitePool};
 
 use crate::domain::ids::{PromptId, RepoId};
 use crate::domain::prompt::{NewPrompt, Prompt, PromptText};
@@ -47,7 +47,12 @@ impl TryFrom<PromptRow> for Prompt {
 }
 
 /// Create a new prompt.
-pub async fn create(pool: &SqlitePool, new_prompt: NewPrompt) -> Result<Prompt, sqlx::Error> {
+///
+/// Accepts any executor (pool or transaction) for transactional safety.
+pub async fn create<'e, E>(executor: E, new_prompt: NewPrompt) -> Result<Prompt, sqlx::Error>
+where
+    E: Executor<'e, Database = Sqlite>,
+{
     let row = sqlx::query_as::<_, PromptRow>(
         r#"
         INSERT INTO prompts (repo_id, name, text, is_default)
@@ -59,7 +64,7 @@ pub async fn create(pool: &SqlitePool, new_prompt: NewPrompt) -> Result<Prompt, 
     .bind(&new_prompt.name)
     .bind(new_prompt.text.as_str())
     .bind(new_prompt.is_default)
-    .fetch_one(pool)
+    .fetch_one(executor)
     .await?;
 
     row.try_into()

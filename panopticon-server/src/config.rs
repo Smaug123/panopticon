@@ -76,6 +76,10 @@ pub enum LlmProviderConfig {
         base_url: Option<String>,
         #[serde(default = "default_reasoning_effort")]
         reasoning_effort: String,
+        /// Context window size in tokens. Defaults to 1M for gpt-5.2.
+        /// Set this lower for models with smaller context windows.
+        #[serde(default)]
+        context_limit_tokens: Option<u32>,
     },
     // Future providers can be added here:
     // Gemini { api_key: String, model: String },
@@ -123,6 +127,15 @@ pub struct SchedulerConfig {
     /// This handles process crashes leaving jobs in 'running' state.
     #[serde(default = "default_job_timeout")]
     pub job_timeout_minutes: u64,
+    /// Maximum number of concurrent jobs.
+    #[serde(default = "default_max_concurrent")]
+    pub max_concurrent_jobs: usize,
+    /// Timeout for git operations (clone, fetch, pull) in seconds.
+    #[serde(default = "default_git_timeout")]
+    pub git_timeout_secs: u64,
+    /// Timeout for LLM API requests in seconds.
+    #[serde(default = "default_llm_timeout")]
+    pub llm_timeout_secs: u64,
 }
 
 fn default_poll_interval() -> u64 {
@@ -137,12 +150,27 @@ fn default_job_timeout() -> u64 {
     30 // 30 minutes default
 }
 
+fn default_max_concurrent() -> usize {
+    3 // Conservative default given 5 DB connections
+}
+
+fn default_git_timeout() -> u64 {
+    300 // 5 minutes for git operations
+}
+
+fn default_llm_timeout() -> u64 {
+    600 // 10 minutes for LLM (reasoning models are slow)
+}
+
 impl Default for SchedulerConfig {
     fn default() -> Self {
         Self {
             poll_interval_secs: default_poll_interval(),
             review_interval_hours: default_review_interval(),
             job_timeout_minutes: default_job_timeout(),
+            max_concurrent_jobs: default_max_concurrent(),
+            git_timeout_secs: default_git_timeout(),
+            llm_timeout_secs: default_llm_timeout(),
         }
     }
 }

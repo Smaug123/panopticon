@@ -66,20 +66,29 @@ async fn main() -> Result<()> {
     tracing::debug!("SQLite JSON1 extension verified");
 
     // Initialize LLM provider
+    let llm_timeout = config.scheduler.llm_timeout_secs;
     let llm: Arc<dyn LlmProvider> = match &config.llm.provider {
         LlmProviderConfig::OpenAi {
             api_key,
             model,
             base_url,
             reasoning_effort,
+            context_limit_tokens,
         } => Arc::new(OpenAiProvider::new(
             api_key.clone(),
             model.clone(),
             base_url.clone(),
             reasoning_effort.clone(),
+            *context_limit_tokens,
+            Some(llm_timeout),
         )),
     };
-    tracing::info!("LLM provider initialized: {}", llm.name());
+    tracing::info!(
+        "LLM provider initialized: {} (context limit: {} tokens, timeout: {}s)",
+        llm.name(),
+        llm.max_context_tokens(),
+        llm_timeout
+    );
 
     // Initialize GitHub fetcher
     let github = Arc::new(GitHubFetcher::new(config.github.repos_dir.clone()));
@@ -103,7 +112,7 @@ async fn main() -> Result<()> {
     let runner_state = state.clone();
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
 
-    tokio::spawn(async move {
+    let runner_handle = tokio::spawn(async move {
         let runner = JobRunner::new(runner_state);
         runner.run(shutdown_rx).await;
     });
@@ -124,6 +133,12 @@ async fn main() -> Result<()> {
             shutdown_tx.send(true).ok();
         })
         .await?;
+
+    // Wait for job runner to complete (it handles its own graceful shutdown)
+    tracing::info!("Waiting for job runner to complete...");
+    if let Err(e) = runner_handle.await {
+        tracing::error!("Job runner panicked: {:?}", e);
+    }
 
     tracing::info!("Server stopped");
     Ok(())

@@ -1,4 +1,5 @@
 use std::pin::Pin;
+use std::time::Duration;
 
 use async_stream::stream;
 use futures::Stream;
@@ -15,6 +16,7 @@ pub struct OpenAiProvider {
     model: String,
     base_url: String,
     reasoning_effort: String,
+    context_limit: u32,
 }
 
 impl OpenAiProvider {
@@ -23,11 +25,19 @@ impl OpenAiProvider {
         model: String,
         base_url: Option<String>,
         reasoning_effort: String,
+        context_limit: Option<u32>,
+        request_timeout_secs: Option<u64>,
     ) -> Self {
         // Use ClientBuilder with no_proxy to avoid system proxy lookup
-        // which can fail in sandboxed test environments on macOS
+        // which can fail in sandboxed test environments on macOS.
+        // Add timeouts to prevent hanging requests:
+        // - connect_timeout: 30s for initial connection
+        // - timeout: configurable, defaults to 10 minutes (reasoning models can be slow)
+        let timeout_secs = request_timeout_secs.unwrap_or(600);
         let client = Client::builder()
             .no_proxy()
+            .connect_timeout(Duration::from_secs(30))
+            .timeout(Duration::from_secs(timeout_secs))
             .build()
             .expect("Failed to create HTTP client");
         Self {
@@ -36,6 +46,7 @@ impl OpenAiProvider {
             model,
             base_url: base_url.unwrap_or_else(|| "https://api.openai.com/v1".to_string()),
             reasoning_effort,
+            context_limit: context_limit.unwrap_or(1_000_000),
         }
     }
 }
@@ -104,8 +115,7 @@ impl LlmProvider for OpenAiProvider {
     }
 
     fn max_context_tokens(&self) -> u32 {
-        // gpt-5.2 supports 1M context
-        1_000_000
+        self.context_limit
     }
 
     fn complete_stream(
@@ -253,19 +263,36 @@ mod tests {
             "gpt-5.2-2025-12-11".to_string(),
             None,
             "high".to_string(),
+            None,
+            None,
         );
         assert_eq!(provider.name(), "openai");
     }
 
     #[test]
-    fn provider_has_reasonable_context_limit() {
+    fn provider_uses_default_context_limit() {
         let provider = OpenAiProvider::new(
             "test-key".to_string(),
             "gpt-5.2-2025-12-11".to_string(),
             None,
             "high".to_string(),
+            None,
+            None,
         );
-        assert!(provider.max_context_tokens() >= 100_000);
+        assert_eq!(provider.max_context_tokens(), 1_000_000);
+    }
+
+    #[test]
+    fn provider_uses_custom_context_limit() {
+        let provider = OpenAiProvider::new(
+            "test-key".to_string(),
+            "gpt-4o".to_string(),
+            None,
+            "high".to_string(),
+            Some(128_000),
+            None,
+        );
+        assert_eq!(provider.max_context_tokens(), 128_000);
     }
 
     #[test]

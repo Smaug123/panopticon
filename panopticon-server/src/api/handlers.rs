@@ -97,14 +97,18 @@ pub async fn create_repo(
         ));
     }
 
-    let repo = repos::create(&state.db, NewRepo { url }).await?;
+    // Use a transaction to ensure repo + default prompt are created atomically.
+    // If prompt creation fails, the repo creation is rolled back.
+    let mut tx = state.db.begin().await?;
+
+    let repo = repos::create(&mut *tx, NewRepo { url }).await?;
 
     // Create default prompt
     let default_prompt_text =
         PromptText::new(DEFAULT_REVIEW_PROMPT.to_string()).expect("Default prompt should be valid");
 
     prompts::create(
-        &state.db,
+        &mut *tx,
         NewPrompt {
             repo_id: repo.id,
             name: "Comprehensive Review".to_string(),
@@ -113,6 +117,8 @@ pub async fn create_repo(
         },
     )
     .await?;
+
+    tx.commit().await?;
 
     Ok((
         StatusCode::CREATED,

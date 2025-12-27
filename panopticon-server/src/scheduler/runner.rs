@@ -1,7 +1,10 @@
+use std::sync::Arc;
 use std::time::Duration;
 
 use futures::StreamExt;
 use sqlx::SqlitePool;
+use tokio::sync::Semaphore;
+use tokio::task::JoinSet;
 use tokio::time::interval;
 
 use crate::db::{jobs, prompts, repos, reviews};
@@ -34,8 +37,12 @@ fn extract_retry_after(err: &anyhow::Error) -> Option<u32> {
 /// occur after `mark_in_progress` is called. The guard should be created after
 /// marking a review as in_progress, and disarmed only after successfully
 /// completing all operations.
+///
+/// On cleanup, also updates `last_checked_at` for the repo to prevent immediate
+/// rescheduling after max retries are exhausted.
 struct ReviewCleanupGuard {
     db: SqlitePool,
+    repo_id: RepoId,
     review_id: ReviewId,
     review_updates: tokio::sync::broadcast::Sender<ReviewUpdate>,
     /// If true, the guard will mark the review as failed on drop.
@@ -49,11 +56,13 @@ struct ReviewCleanupGuard {
 impl ReviewCleanupGuard {
     fn new(
         db: SqlitePool,
+        repo_id: RepoId,
         review_id: ReviewId,
         review_updates: tokio::sync::broadcast::Sender<ReviewUpdate>,
     ) -> Self {
         Self {
             db,
+            repo_id,
             review_id,
             review_updates,
             should_cleanup: true,
@@ -98,12 +107,14 @@ impl Drop for ReviewCleanupGuard {
         if self.should_cleanup {
             // We're being dropped without completing successfully.
             // Mark the review as failed to prevent it being stuck in_progress.
+            // Also update last_checked_at to prevent immediate rescheduling.
             //
             // Since Drop is sync but our DB operations are async, we spawn a
             // blocking task to handle the cleanup. This is acceptable because:
             // 1. We're in an error path anyway
             // 2. The alternative (stuck review) is worse
             let db = self.db.clone();
+            let repo_id = self.repo_id;
             let review_id = self.review_id;
             let review_updates = self.review_updates.clone();
             // Use the actual error if set, otherwise fall back to generic message
@@ -114,6 +125,16 @@ impl Drop for ReviewCleanupGuard {
 
             // Use tokio::spawn to run cleanup asynchronously
             tokio::spawn(async move {
+                // Update last_checked_at to prevent immediate rescheduling after max retries.
+                // This covers all failure paths (git fetch, get_contents, prompt failures, etc.)
+                if let Err(e) = repos::update_last_checked(&db, repo_id).await {
+                    tracing::error!(
+                        "Failed to update last_checked_at for repo {} during cleanup: {}",
+                        repo_id.into_inner(),
+                        e
+                    );
+                }
+
                 if let Err(e) = reviews::mark_failed(&db, review_id, &error_msg).await {
                     tracing::error!(
                         "Failed to mark review {} as failed during cleanup: {}",
@@ -140,41 +161,100 @@ impl Drop for ReviewCleanupGuard {
 }
 
 /// Background job runner that processes the job queue.
+///
+/// Jobs are spawned as background tasks, allowing the runner to remain responsive
+/// and process multiple jobs concurrently (up to max_concurrent_jobs).
 pub struct JobRunner {
     state: AppState,
+    /// Semaphore to limit concurrent jobs
+    semaphore: Arc<Semaphore>,
+    /// Maximum concurrent jobs
+    max_concurrent: usize,
 }
 
 impl JobRunner {
     pub fn new(state: AppState) -> Self {
-        Self { state }
+        let max_concurrent = state.config.scheduler.max_concurrent_jobs;
+        Self {
+            semaphore: Arc::new(Semaphore::new(max_concurrent)),
+            max_concurrent,
+            state,
+        }
     }
 
     /// Run the job runner until shutdown signal is received.
+    ///
+    /// Jobs are spawned as background tasks and tracked in a JoinSet.
+    /// On shutdown, waits up to 60s for in-flight tasks to complete before aborting.
     pub async fn run(&self, mut shutdown: tokio::sync::watch::Receiver<bool>) {
         let poll_interval = Duration::from_secs(self.state.config.scheduler.poll_interval_secs);
         let mut ticker = interval(poll_interval);
+        let mut tasks: JoinSet<()> = JoinSet::new();
 
         tracing::info!(
-            "Job runner started, polling every {}s",
-            poll_interval.as_secs()
+            "Job runner started, polling every {}s, max {} concurrent jobs",
+            poll_interval.as_secs(),
+            self.max_concurrent
         );
 
         loop {
             tokio::select! {
                 _ = ticker.tick() => {
-                    self.tick().await;
+                    self.tick(&mut tasks).await;
+                }
+                // Reap completed tasks without blocking
+                Some(result) = tasks.join_next(), if !tasks.is_empty() => {
+                    if let Err(e) = result {
+                        tracing::error!("Job task panicked: {:?}", e);
+                    }
                 }
                 _ = shutdown.changed() => {
                     if *shutdown.borrow() {
-                        tracing::info!("Job runner shutting down");
+                        tracing::info!(
+                            "Job runner shutting down, waiting for {} in-flight task(s)",
+                            tasks.len()
+                        );
                         break;
                     }
                 }
             }
         }
+
+        // Graceful shutdown: wait for all in-flight tasks with timeout
+        let shutdown_timeout = Duration::from_secs(60);
+        let deadline = tokio::time::Instant::now() + shutdown_timeout;
+
+        while !tasks.is_empty() {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                tracing::warn!(
+                    "Shutdown timeout: {} task(s) still running, aborting",
+                    tasks.len()
+                );
+                tasks.abort_all();
+                break;
+            }
+
+            match tokio::time::timeout(remaining, tasks.join_next()).await {
+                Ok(Some(Ok(()))) => {
+                    tracing::debug!("Task completed during shutdown, {} remaining", tasks.len());
+                }
+                Ok(Some(Err(e))) => {
+                    tracing::error!("Task panicked during shutdown: {:?}", e);
+                }
+                Ok(None) => break, // All tasks done
+                Err(_) => {
+                    tracing::warn!("Shutdown timeout reached");
+                    tasks.abort_all();
+                    break;
+                }
+            }
+        }
+
+        tracing::info!("Job runner shutdown complete");
     }
 
-    async fn tick(&self) {
+    async fn tick(&self, tasks: &mut JoinSet<()>) {
         // Reclaim jobs stuck in 'running' state (e.g., from process crashes)
         let timeout_minutes = self.state.config.scheduler.job_timeout_minutes as i64;
         match jobs::reclaim_stuck(&self.state.db, timeout_minutes).await {
@@ -187,8 +267,8 @@ impl JobRunner {
             _ => {}
         }
 
-        // Process pending jobs
-        self.process_pending_jobs().await;
+        // Process pending jobs (spawns tasks up to concurrency limit)
+        self.process_pending_jobs(tasks).await;
 
         // Schedule daily reviews for repos that need them
         if let Err(e) = self.schedule_daily_reviews().await {
@@ -196,37 +276,78 @@ impl JobRunner {
         }
     }
 
-    async fn process_pending_jobs(&self) {
-        // Process jobs one at a time
+    async fn process_pending_jobs(&self, tasks: &mut JoinSet<()>) {
+        // Spawn jobs up to concurrency limit
         loop {
+            // Try to acquire permit (non-blocking check)
+            let permit = match self.semaphore.clone().try_acquire_owned() {
+                Ok(p) => p,
+                Err(_) => {
+                    // At capacity, stop claiming jobs
+                    tracing::debug!("At concurrency limit, not claiming more jobs");
+                    break;
+                }
+            };
+
             match jobs::claim_next(&self.state.db).await {
                 Ok(Some(job)) => {
-                    tracing::info!("Processing job {}: {:?}", job.id, job.payload);
-                    self.execute_job(job).await;
+                    let job_id = job.id;
+                    tracing::info!("Claimed job {}: {:?}", job_id, job.payload);
+
+                    // Clone what we need for the spawned task
+                    let state = self.state.clone();
+                    let git_timeout =
+                        Duration::from_secs(self.state.config.scheduler.git_timeout_secs);
+
+                    tasks.spawn(async move {
+                        // Permit is held for duration of task, released on drop
+                        let _permit = permit;
+
+                        let result = Self::execute_job_static(&state, job, git_timeout).await;
+
+                        match &result {
+                            Ok(()) => {
+                                tracing::info!("Job {} completed successfully", job_id)
+                            }
+                            Err(e) => tracing::error!("Job {} failed: {}", job_id, e),
+                        }
+                    });
                 }
-                Ok(None) => break, // No more pending jobs
+                Ok(None) => {
+                    // No more pending jobs, release permit and stop
+                    drop(permit);
+                    break;
+                }
                 Err(e) => {
                     tracing::error!("Failed to claim job: {}", e);
+                    drop(permit);
                     break;
                 }
             }
         }
     }
 
-    async fn execute_job(&self, job: Job) {
+    /// Execute a job - static version for spawning in background tasks.
+    async fn execute_job_static(
+        state: &AppState,
+        job: Job,
+        git_timeout: Duration,
+    ) -> anyhow::Result<()> {
         let result = match &job.payload {
-            JobPayload::ReviewRepo { repo_id, force } => self.run_review(*repo_id, *force).await,
+            JobPayload::ReviewRepo { repo_id, force } => {
+                Self::run_review_static(state, *repo_id, *force, git_timeout).await
+            }
         };
 
         match result {
             Ok(()) => {
-                if let Err(e) = jobs::complete(&self.state.db, job.id).await {
+                if let Err(e) = jobs::complete(&state.db, job.id).await {
                     tracing::error!("Failed to mark job {} as complete: {}", job.id, e);
                 }
+                Ok(())
             }
             Err(e) => {
                 let error_msg = e.to_string();
-                tracing::error!("Job {} failed: {}", job.id, error_msg);
 
                 let should_retry = job.attempts < job.max_attempts;
 
@@ -234,8 +355,8 @@ impl JobRunner {
                 // The error chain may contain LlmError::RateLimited
                 let retry_after_secs = extract_retry_after(&e);
 
-                if let Err(e) = jobs::fail(
-                    &self.state.db,
+                if let Err(db_err) = jobs::fail(
+                    &state.db,
                     job.id,
                     &error_msg,
                     should_retry,
@@ -243,15 +364,22 @@ impl JobRunner {
                 )
                 .await
                 {
-                    tracing::error!("Failed to mark job {} as failed: {}", job.id, e);
+                    tracing::error!("Failed to mark job {} as failed: {}", job.id, db_err);
                 }
+                Err(e)
             }
         }
     }
 
-    async fn run_review(&self, repo_id: RepoId, force: bool) -> anyhow::Result<()> {
+    /// Run a review - static version for spawning in background tasks.
+    async fn run_review_static(
+        state: &AppState,
+        repo_id: RepoId,
+        force: bool,
+        git_timeout: Duration,
+    ) -> anyhow::Result<()> {
         // Get repo
-        let repo = repos::get_by_id(&self.state.db, repo_id)
+        let repo = repos::get_by_id(&state.db, repo_id)
             .await?
             .ok_or_else(|| anyhow::anyhow!("Repo not found"))?;
 
@@ -261,8 +389,10 @@ impl JobRunner {
             repo.url.name()
         );
 
-        // Fetch/update repo and get current SHA
-        let current_sha = self.state.github.fetch(&repo.url).await?;
+        // Fetch/update repo and get current SHA (with timeout)
+        let current_sha = tokio::time::timeout(git_timeout, state.github.fetch(&repo.url))
+            .await
+            .map_err(|_| anyhow::anyhow!("Git fetch timed out after {:?}", git_timeout))??;
 
         // Check if we should skip (no changes since last review)
         if !force {
@@ -271,14 +401,14 @@ impl JobRunner {
                     tracing::info!("No changes since last review, skipping");
                     // Record that we checked, even though we're not doing a full review.
                     // This prevents the scheduler from re-queueing this repo every poll.
-                    repos::update_last_checked(&self.state.db, repo_id).await?;
+                    repos::update_last_checked(&state.db, repo_id).await?;
                     return Ok(());
                 }
             }
         }
 
         // Get enabled prompts
-        let prompts_list = prompts::list_enabled_by_repo(&self.state.db, repo_id).await?;
+        let prompts_list = prompts::list_enabled_by_repo(&state.db, repo_id).await?;
         if prompts_list.is_empty() {
             tracing::warn!("No enabled prompts for repo, skipping review");
             return Ok(());
@@ -286,7 +416,7 @@ impl JobRunner {
 
         // Create review record
         let review = reviews::create(
-            &self.state.db,
+            &state.db,
             NewReview {
                 repo_id,
                 commit_sha: current_sha.clone(),
@@ -300,23 +430,23 @@ impl JobRunner {
         .await?;
 
         // Mark review as in progress
-        reviews::mark_in_progress(&self.state.db, review.id).await?;
+        reviews::mark_in_progress(&state.db, review.id).await?;
 
         // Create cleanup guard - this ensures the review is marked as failed
         // if we early-return due to any error after this point.
         // Use `cleanup_guard.check()` for fallible operations to preserve error messages.
         let mut cleanup_guard = ReviewCleanupGuard::new(
-            self.state.db.clone(),
+            state.db.clone(),
+            repo_id,
             review.id,
-            self.state.review_updates.clone(),
+            state.review_updates.clone(),
         );
 
         let start_time = std::time::Instant::now();
 
         // Get repo contents
         let filter = FileFilter::default();
-        let contents =
-            cleanup_guard.check(self.state.github.get_contents(&repo.url, &filter).await)?;
+        let contents = cleanup_guard.check(state.github.get_contents(&repo.url, &filter).await)?;
 
         tracing::info!(
             "Loaded {} files ({} bytes)",
@@ -327,7 +457,7 @@ impl JobRunner {
         // Chunk contents based on the model's context limit.
         // This prevents context_length_exceeded errors with smaller-context models.
         // We use 80% of the model's limit to leave room for the prompt and response.
-        let model_context = self.state.llm.max_context_tokens();
+        let model_context = state.llm.max_context_tokens();
         let chunk_limit = (model_context as f64 * 0.8) as u32;
         let strategy = ChunkingStrategy::with_max_tokens(chunk_limit);
         let chunks = chunk_contents(&contents.files, &strategy);
@@ -339,17 +469,12 @@ impl JobRunner {
         for prompt in &prompts_list {
             tracing::info!("Running prompt: {}", prompt.name);
 
-            match self.run_prompt_review(review.id, prompt, &chunks).await {
+            match Self::run_prompt_review_static(state, review.id, prompt, &chunks).await {
                 Ok(output) => {
                     // Store result
-                    if let Err(e) = reviews::add_result(
-                        &self.state.db,
-                        review.id,
-                        prompt.id,
-                        &prompt.name,
-                        &output,
-                    )
-                    .await
+                    if let Err(e) =
+                        reviews::add_result(&state.db, review.id, prompt.id, &prompt.name, &output)
+                            .await
                     {
                         tracing::error!("Failed to store review result: {}", e);
                         had_error = true;
@@ -365,7 +490,14 @@ impl JobRunner {
         let duration = start_time.elapsed();
 
         if had_error {
-            reviews::mark_failed(&self.state.db, review.id, "Some prompts failed").await?;
+            // Update last_checked_at even on failure to prevent immediate rescheduling.
+            // Without this, failed reviews would create an infinite loop:
+            // 1. Review fails, job exhausts max retries
+            // 2. Scheduler sees needs_check() = true (last_checked_at unchanged)
+            // 3. Scheduler creates new job immediately
+            // 4. Goto 1
+            repos::update_last_checked(&state.db, repo_id).await.ok();
+            reviews::mark_failed(&state.db, review.id, "Some prompts failed").await?;
             // Broadcast AFTER DB update to prevent race condition where UI refreshes
             // and sees stale in_progress status
             cleanup_guard.broadcast_complete();
@@ -385,12 +517,11 @@ impl JobRunner {
         // This ensures that if update_last_commit fails, the review is marked failed
         // (by the cleanup guard) and on retry we don't create a duplicate review
         // for the same commit.
-        cleanup_guard
-            .check(repos::update_last_commit(&self.state.db, repo_id, &current_sha).await)?;
+        cleanup_guard.check(repos::update_last_commit(&state.db, repo_id, &current_sha).await)?;
         // Also update last_checked_at so the scheduler knows when we last checked this repo
-        cleanup_guard.check(repos::update_last_checked(&self.state.db, repo_id).await)?;
+        cleanup_guard.check(repos::update_last_checked(&state.db, repo_id).await)?;
         cleanup_guard.check(
-            reviews::mark_completed(&self.state.db, review.id, duration.as_secs() as u32).await,
+            reviews::mark_completed(&state.db, review.id, duration.as_secs() as u32).await,
         )?;
 
         // Broadcast AFTER DB update to prevent race condition
@@ -403,8 +534,8 @@ impl JobRunner {
         Ok(())
     }
 
-    async fn run_prompt_review(
-        &self,
+    async fn run_prompt_review_static(
+        state: &AppState,
         review_id: crate::domain::ids::ReviewId,
         prompt: &crate::domain::prompt::Prompt,
         chunks: &[crate::github::concat::Chunk],
@@ -424,8 +555,7 @@ impl JobRunner {
                 max_tokens: 16_000,
             };
 
-            self.run_llm_streaming(review_id, &prompt.name, request)
-                .await?
+            Self::run_llm_streaming_static(state, review_id, &prompt.name, request).await?
         } else {
             // Multiple chunks: review each and aggregate
             let mut all_reasoning = Vec::new();
@@ -446,9 +576,8 @@ impl JobRunner {
                     max_tokens: 8_000,
                 };
 
-                let chunk_output = self
-                    .run_llm_streaming(review_id, &prompt.name, request)
-                    .await?;
+                let chunk_output =
+                    Self::run_llm_streaming_static(state, review_id, &prompt.name, request).await?;
 
                 // Use as_raw() to get the content for aggregation
                 all_reasoning.push(format!(
@@ -474,7 +603,7 @@ impl JobRunner {
         };
 
         // Send prompt complete event once per prompt (not per chunk)
-        let _ = self.state.review_updates.send(ReviewUpdate {
+        let _ = state.review_updates.send(ReviewUpdate {
             review_id,
             prompt_name: prompt.name.clone(),
             kind: ReviewUpdateKind::PromptComplete,
@@ -483,13 +612,13 @@ impl JobRunner {
         Ok(output)
     }
 
-    async fn run_llm_streaming(
-        &self,
+    async fn run_llm_streaming_static(
+        state: &AppState,
         review_id: crate::domain::ids::ReviewId,
         prompt_name: &str,
         request: LlmRequest,
     ) -> anyhow::Result<crate::domain::review::ReviewOutput> {
-        let mut stream = self.state.llm.complete_stream(request);
+        let mut stream = state.llm.complete_stream(request);
         let mut full_text = String::new();
 
         while let Some(chunk_result) = stream.next().await {
@@ -498,7 +627,7 @@ impl JobRunner {
 
             // Broadcast chunk updates for SSE clients (only if there's text)
             if !chunk.text.is_empty() {
-                let _ = self.state.review_updates.send(ReviewUpdate {
+                let _ = state.review_updates.send(ReviewUpdate {
                     review_id,
                     prompt_name: prompt_name.to_string(),
                     kind: ReviewUpdateKind::Chunk { text: chunk.text },
