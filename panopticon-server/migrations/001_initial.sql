@@ -76,7 +76,12 @@ CREATE TABLE jobs (
     started_at TEXT,
     completed_at TEXT,
     last_error TEXT,
+    -- Heartbeat for detecting truly stuck jobs. Updated periodically while running.
+    -- Only jobs with stale heartbeats should be reclaimed (not just old started_at).
+    -- This prevents duplicate execution when reviews take many hours.
+    last_heartbeat TEXT,
     created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
 CREATE INDEX idx_jobs_status_scheduled ON jobs(status, scheduled_at);
+CREATE INDEX idx_jobs_running_heartbeat ON jobs(status, last_heartbeat) WHERE status = 'running';

@@ -123,10 +123,15 @@ pub struct SchedulerConfig {
     pub poll_interval_secs: u64,
     #[serde(default = "default_review_interval")]
     pub review_interval_hours: u64,
-    /// Jobs running longer than this are considered stuck and will be reclaimed.
-    /// This handles process crashes leaving jobs in 'running' state.
-    #[serde(default = "default_job_timeout")]
-    pub job_timeout_minutes: u64,
+    /// How often running jobs should update their heartbeat (in seconds).
+    /// Jobs must update their heartbeat more frequently than heartbeat_timeout_minutes.
+    #[serde(default = "default_heartbeat_interval")]
+    pub heartbeat_interval_secs: u64,
+    /// Jobs whose heartbeat is older than this are considered crashed and will be reclaimed.
+    /// This should be significantly longer than heartbeat_interval_secs to allow for
+    /// temporary delays (e.g., during LLM API calls).
+    #[serde(default = "default_heartbeat_timeout")]
+    pub heartbeat_timeout_minutes: u64,
     /// Maximum number of concurrent jobs.
     #[serde(default = "default_max_concurrent")]
     pub max_concurrent_jobs: usize,
@@ -146,8 +151,12 @@ fn default_review_interval() -> u64 {
     24
 }
 
-fn default_job_timeout() -> u64 {
-    30 // 30 minutes default
+fn default_heartbeat_interval() -> u64 {
+    30 // Update heartbeat every 30 seconds
+}
+
+fn default_heartbeat_timeout() -> u64 {
+    5 // Reclaim jobs with no heartbeat for 5 minutes (allows for LLM latency)
 }
 
 fn default_max_concurrent() -> usize {
@@ -167,7 +176,8 @@ impl Default for SchedulerConfig {
         Self {
             poll_interval_secs: default_poll_interval(),
             review_interval_hours: default_review_interval(),
-            job_timeout_minutes: default_job_timeout(),
+            heartbeat_interval_secs: default_heartbeat_interval(),
+            heartbeat_timeout_minutes: default_heartbeat_timeout(),
             max_concurrent_jobs: default_max_concurrent(),
             git_timeout_secs: default_git_timeout(),
             llm_timeout_secs: default_llm_timeout(),

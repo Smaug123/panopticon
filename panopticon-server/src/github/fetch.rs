@@ -110,15 +110,19 @@ impl GitHubFetcher {
 
         tracing::info!("Cloning {} to {}", url.clone_url(), path.display());
 
-        let output = Command::new("git")
+        // Use kill_on_drop to ensure the child process is terminated if the future is dropped
+        // (e.g., due to a timeout). Without this, timed-out git commands can keep running
+        // and mutate the repo or hold locks while a retry starts.
+        let mut child = Command::new("git")
             .args(["clone", "--depth", "1", &url.clone_url()])
             .arg(path)
-            .output()
-            .await?;
+            .kill_on_drop(true)
+            .spawn()?;
 
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(FetchError::GitError(stderr.to_string()));
+        let status = child.wait().await?;
+
+        if !status.success() {
+            return Err(FetchError::GitError("clone failed".to_string()));
         }
 
         Ok(())
@@ -127,39 +131,45 @@ impl GitHubFetcher {
     async fn pull(&self, path: &Path) -> Result<(), FetchError> {
         tracing::debug!("Updating repo at {}", path.display());
 
-        // Fetch latest
-        let output = Command::new("git")
+        // Fetch latest - use kill_on_drop to terminate if future is dropped (timeout)
+        let mut child = Command::new("git")
             .args(["fetch", "--depth", "1", "origin"])
             .current_dir(path)
-            .output()
-            .await?;
+            .kill_on_drop(true)
+            .spawn()?;
 
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(FetchError::GitError(format!("fetch failed: {}", stderr)));
+        let status = child.wait().await?;
+        if !status.success() {
+            return Err(FetchError::GitError("fetch failed".to_string()));
         }
 
-        // Reset to origin/HEAD
-        let output = Command::new("git")
+        // Reset to origin/HEAD - use kill_on_drop to terminate if future is dropped (timeout)
+        let mut child = Command::new("git")
             .args(["reset", "--hard", "origin/HEAD"])
             .current_dir(path)
-            .output()
-            .await?;
+            .kill_on_drop(true)
+            .spawn()?;
 
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(FetchError::GitError(format!("reset failed: {}", stderr)));
+        let status = child.wait().await?;
+        if !status.success() {
+            return Err(FetchError::GitError("reset failed".to_string()));
         }
 
         Ok(())
     }
 
     async fn get_head_sha(&self, path: &Path) -> Result<CommitSha, FetchError> {
-        let output = Command::new("git")
+        // For rev-parse, we need the output, so use output() but still with kill_on_drop.
+        // The Child returned by spawn() can be waited with wait_with_output().
+        let child = Command::new("git")
             .args(["rev-parse", "HEAD"])
             .current_dir(path)
-            .output()
-            .await?;
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .kill_on_drop(true)
+            .spawn()?;
+
+        let output = child.wait_with_output().await?;
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);

@@ -60,6 +60,9 @@ pub struct Job {
     pub started_at: Option<DateTime<Utc>>,
     pub completed_at: Option<DateTime<Utc>>,
     pub last_error: Option<String>,
+    /// Last heartbeat timestamp. Updated periodically while running.
+    /// Used to detect truly stuck jobs (worker crash) vs long-running jobs.
+    pub last_heartbeat: Option<DateTime<Utc>>,
     pub created_at: DateTime<Utc>,
 }
 

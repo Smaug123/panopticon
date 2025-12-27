@@ -1,5 +1,19 @@
 use std::path::Path;
 
+// The glob patterns in FileFilter use forward slashes (`/`) as path separators.
+// On Windows, paths use backslashes (`\`), so patterns like `**/node_modules/**`
+// won't match paths like `node_modules\foo\bar.js`. This would cause large
+// generated directories to leak into prompts and blow token budgets.
+//
+// Rather than attempting to support Windows (which would require rewriting all
+// patterns and handling cross-platform path normalization), we simply refuse
+// to compile on Windows.
+#[cfg(windows)]
+compile_error!(
+    "panopticon-server does not support Windows. \
+     File filtering uses Unix-style glob patterns that won't match Windows paths."
+);
+
 /// File filter configuration for excluding files from repo content.
 #[derive(Debug, Clone)]
 pub struct FileFilter {

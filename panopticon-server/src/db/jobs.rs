@@ -17,6 +17,7 @@ struct JobRow {
     started_at: Option<String>,
     completed_at: Option<String>,
     last_error: Option<String>,
+    last_heartbeat: Option<String>,
     created_at: String,
 }
 
@@ -46,6 +47,11 @@ impl TryFrom<JobRow> for Job {
             .as_deref()
             .map(parse_datetime)
             .transpose()?;
+        let last_heartbeat = row
+            .last_heartbeat
+            .as_deref()
+            .map(parse_datetime)
+            .transpose()?;
         let created_at = parse_datetime(&row.created_at)?;
 
         Ok(Job {
@@ -58,6 +64,7 @@ impl TryFrom<JobRow> for Job {
             started_at,
             completed_at,
             last_error: row.last_error,
+            last_heartbeat,
             created_at,
         })
     }
@@ -73,7 +80,7 @@ pub async fn create(pool: &SqlitePool, new_job: NewJob) -> Result<Job, sqlx::Err
         r#"
         INSERT INTO jobs (payload, max_attempts, scheduled_at)
         VALUES (?, ?, ?)
-        RETURNING id, payload, status, attempts, max_attempts, scheduled_at, started_at, completed_at, last_error, created_at
+        RETURNING id, payload, status, attempts, max_attempts, scheduled_at, started_at, completed_at, last_error, last_heartbeat, created_at
         "#,
     )
     .bind(&payload)
@@ -88,6 +95,7 @@ pub async fn create(pool: &SqlitePool, new_job: NewJob) -> Result<Job, sqlx::Err
 
 /// Atomically claim the next available job.
 /// Uses UPDATE...RETURNING to prevent race conditions.
+/// Sets last_heartbeat to now, which must be updated periodically while running.
 pub async fn claim_next(pool: &SqlitePool) -> Result<Option<Job>, sqlx::Error> {
     let now = Utc::now().to_rfc3339();
     let row = sqlx::query_as::<_, JobRow>(
@@ -95,6 +103,7 @@ pub async fn claim_next(pool: &SqlitePool) -> Result<Option<Job>, sqlx::Error> {
         UPDATE jobs
         SET status = 'running',
             started_at = ?,
+            last_heartbeat = ?,
             attempts = attempts + 1
         WHERE id = (
             SELECT id FROM jobs
@@ -103,9 +112,10 @@ pub async fn claim_next(pool: &SqlitePool) -> Result<Option<Job>, sqlx::Error> {
             ORDER BY scheduled_at ASC
             LIMIT 1
         )
-        RETURNING id, payload, status, attempts, max_attempts, scheduled_at, started_at, completed_at, last_error, created_at
+        RETURNING id, payload, status, attempts, max_attempts, scheduled_at, started_at, completed_at, last_error, last_heartbeat, created_at
         "#,
     )
+    .bind(&now)
     .bind(&now)
     .bind(&now)
     .fetch_optional(pool)
@@ -127,6 +137,25 @@ pub async fn complete(pool: &SqlitePool, id: JobId) -> Result<(), sqlx::Error> {
         UPDATE jobs
         SET status = 'completed', completed_at = ?
         WHERE id = ?
+        "#,
+    )
+    .bind(&now)
+    .bind(id.into_inner())
+    .execute(pool)
+    .await?;
+
+    Ok(())
+}
+
+/// Update the heartbeat for a running job.
+/// This must be called periodically to prevent the job from being reclaimed.
+pub async fn update_heartbeat(pool: &SqlitePool, id: JobId) -> Result<(), sqlx::Error> {
+    let now = Utc::now().to_rfc3339();
+    sqlx::query(
+        r#"
+        UPDATE jobs
+        SET last_heartbeat = ?
+        WHERE id = ? AND status = 'running'
         "#,
     )
     .bind(&now)
@@ -267,21 +296,28 @@ pub async fn cleanup_old(pool: &SqlitePool, days: i64) -> Result<u64, sqlx::Erro
     Ok(result.rows_affected())
 }
 
-/// Reclaim jobs that have been stuck in 'running' state for too long.
+/// Reclaim jobs whose heartbeat has gone stale.
 ///
-/// This handles the case where a process crashes while a job is running.
-/// Jobs stuck for longer than `stuck_minutes` are either:
+/// This handles the case where a worker process crashes while a job is running.
+/// Jobs are only reclaimed if their `last_heartbeat` is older than `heartbeat_timeout_minutes`.
+/// This is distinct from jobs that are simply running for a long time - those will
+/// keep updating their heartbeat and won't be reclaimed.
+///
+/// Jobs with stale heartbeats are either:
 /// - Reset to 'pending' if attempts < max_attempts (for retry)
 /// - Marked as 'failed' if attempts >= max_attempts
 ///
 /// Returns the number of jobs reclaimed.
-pub async fn reclaim_stuck(pool: &SqlitePool, stuck_minutes: i64) -> Result<u64, sqlx::Error> {
-    let cutoff = (Utc::now() - chrono::Duration::minutes(stuck_minutes)).to_rfc3339();
+pub async fn reclaim_stuck(
+    pool: &SqlitePool,
+    heartbeat_timeout_minutes: i64,
+) -> Result<u64, sqlx::Error> {
+    let cutoff = (Utc::now() - chrono::Duration::minutes(heartbeat_timeout_minutes)).to_rfc3339();
     let now = Utc::now().to_rfc3339();
 
-    // Update stuck running jobs:
-    // - If attempts < max_attempts: set back to pending for retry
-    // - If attempts >= max_attempts: mark as failed
+    // Only reclaim jobs with stale heartbeats, not just old started_at.
+    // A job that's been running for hours but still updating its heartbeat is fine.
+    // A job whose heartbeat stopped updating indicates a crashed worker.
     let result = sqlx::query(
         r#"
         UPDATE jobs
@@ -290,15 +326,15 @@ pub async fn reclaim_stuck(pool: &SqlitePool, stuck_minutes: i64) -> Result<u64,
                 ELSE 'failed'
             END,
             last_error = CASE
-                WHEN attempts < max_attempts THEN 'Job reclaimed after stuck in running state'
-                ELSE 'Job failed after exceeding max attempts while stuck'
+                WHEN attempts < max_attempts THEN 'Job reclaimed: worker stopped sending heartbeats'
+                ELSE 'Job failed after exceeding max attempts (worker unresponsive)'
             END,
             completed_at = CASE
                 WHEN attempts >= max_attempts THEN ?
                 ELSE NULL
             END
         WHERE status = 'running'
-          AND started_at < ?
+          AND last_heartbeat < ?
         "#,
     )
     .bind(&now)

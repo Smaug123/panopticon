@@ -255,11 +255,13 @@ impl JobRunner {
     }
 
     async fn tick(&self, tasks: &mut JoinSet<()>) {
-        // Reclaim jobs stuck in 'running' state (e.g., from process crashes)
-        let timeout_minutes = self.state.config.scheduler.job_timeout_minutes as i64;
-        match jobs::reclaim_stuck(&self.state.db, timeout_minutes).await {
+        // Reclaim jobs with stale heartbeats (e.g., from process crashes).
+        // This only affects jobs whose heartbeat hasn't been updated - long-running
+        // jobs that are still updating their heartbeat will not be reclaimed.
+        let heartbeat_timeout = self.state.config.scheduler.heartbeat_timeout_minutes as i64;
+        match jobs::reclaim_stuck(&self.state.db, heartbeat_timeout).await {
             Ok(count) if count > 0 => {
-                tracing::warn!("Reclaimed {} stuck job(s)", count);
+                tracing::warn!("Reclaimed {} stuck job(s) with stale heartbeats", count);
             }
             Err(e) => {
                 tracing::error!("Failed to reclaim stuck jobs: {}", e);
@@ -298,12 +300,34 @@ impl JobRunner {
                     let state = self.state.clone();
                     let git_timeout =
                         Duration::from_secs(self.state.config.scheduler.git_timeout_secs);
+                    let heartbeat_interval =
+                        Duration::from_secs(self.state.config.scheduler.heartbeat_interval_secs);
 
                     tasks.spawn(async move {
                         // Permit is held for duration of task, released on drop
                         let _permit = permit;
 
+                        // Spawn a background task to periodically update the heartbeat.
+                        // This keeps the job from being reclaimed while it's still running.
+                        let db = state.db.clone();
+                        let heartbeat_handle = tokio::spawn(async move {
+                            let mut ticker = interval(heartbeat_interval);
+                            loop {
+                                ticker.tick().await;
+                                if let Err(e) = jobs::update_heartbeat(&db, job_id).await {
+                                    tracing::warn!(
+                                        "Failed to update heartbeat for job {}: {}",
+                                        job_id,
+                                        e
+                                    );
+                                }
+                            }
+                        });
+
                         let result = Self::execute_job_static(&state, job, git_timeout).await;
+
+                        // Stop the heartbeat task now that the job is done
+                        heartbeat_handle.abort();
 
                         match &result {
                             Ok(()) => {
@@ -454,22 +478,51 @@ impl JobRunner {
             contents.total_size
         );
 
-        // Chunk contents based on the model's context limit.
-        // This prevents context_length_exceeded errors with smaller-context models.
-        // We use 80% of the model's limit to leave room for the prompt and response.
+        // Calculate context budget, accounting for both input and output tokens.
+        // The model's context window must fit: system_prompt + user_prompt + output.
         let model_context = state.llm.max_context_tokens();
-        let chunk_limit = (model_context as f64 * 0.8) as u32;
-        let strategy = ChunkingStrategy::with_max_tokens(chunk_limit);
+
+        // Reserve space for output tokens. Cap at reasonable values that work across models.
+        // Single-chunk reviews can have longer outputs; multi-chunk need aggregation.
+        // For very small context models, we may need to reduce these further.
+        let single_chunk_output = 16_000u32.min(model_context / 4);
+        let multi_chunk_output = 8_000u32.min(model_context / 8);
+
+        // Reserve ~10k tokens for system prompt and formatting overhead
+        let prompt_overhead = 10_000u32.min(model_context / 10);
+
+        // Calculate max input tokens, accounting for output and prompt overhead.
+        // Use the larger output budget (single_chunk) for conservative chunk sizing.
+        let input_budget = model_context
+            .saturating_sub(single_chunk_output)
+            .saturating_sub(prompt_overhead);
+
+        let strategy = ChunkingStrategy::with_max_tokens(input_budget);
         let chunks = chunk_contents(&contents.files, &strategy);
 
-        tracing::info!("Split into {} chunk(s)", chunks.len());
+        tracing::info!(
+            "Split into {} chunk(s) (input budget: {} tokens, output: {}/{} tokens)",
+            chunks.len(),
+            input_budget,
+            single_chunk_output,
+            multi_chunk_output
+        );
 
         // For each prompt, run review
         let mut had_error = false;
         for prompt in &prompts_list {
             tracing::info!("Running prompt: {}", prompt.name);
 
-            match Self::run_prompt_review_static(state, review.id, prompt, &chunks).await {
+            match Self::run_prompt_review_static(
+                state,
+                review.id,
+                prompt,
+                &chunks,
+                single_chunk_output,
+                multi_chunk_output,
+            )
+            .await
+            {
                 Ok(output) => {
                     // Store result
                     if let Err(e) =
@@ -539,6 +592,8 @@ impl JobRunner {
         review_id: crate::domain::ids::ReviewId,
         prompt: &crate::domain::prompt::Prompt,
         chunks: &[crate::github::concat::Chunk],
+        single_chunk_max_output: u32,
+        multi_chunk_max_output: u32,
     ) -> anyhow::Result<crate::domain::review::ReviewOutput> {
         use crate::domain::review::ReviewOutput;
 
@@ -552,7 +607,7 @@ impl JobRunner {
                     "Please review the following codebase:\n\n{}",
                     chunks[0].content
                 ),
-                max_tokens: 16_000,
+                max_tokens: single_chunk_max_output,
             };
 
             Self::run_llm_streaming_static(state, review_id, &prompt.name, request).await?
@@ -573,7 +628,7 @@ impl JobRunner {
                 let request = LlmRequest {
                     system_prompt: system_prompt.clone(),
                     user_prompt: chunk_prompt,
-                    max_tokens: 8_000,
+                    max_tokens: multi_chunk_max_output,
                 };
 
                 let chunk_output =

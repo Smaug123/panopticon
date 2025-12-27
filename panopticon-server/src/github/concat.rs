@@ -102,25 +102,16 @@ fn chunk_by_file(files: &[FileContent], max_tokens: u32) -> Vec<Chunk> {
         let file_content = format_single_file(file);
         let file_tokens = estimate_tokens(&file_content);
 
-        // If single file exceeds limit, it gets its own chunk
+        // Skip files that exceed the token limit entirely.
+        // Previously we'd add them as solo chunks, but that would just cause
+        // context_length_exceeded errors from the LLM. Better to skip and log.
         if file_tokens > max_tokens {
-            // Flush current chunk first
-            if current_files > 0 {
-                chunks.push(Chunk {
-                    content: std::mem::take(&mut current_content),
-                    file_count: current_files,
-                    estimated_tokens: current_tokens,
-                });
-                current_files = 0;
-                current_tokens = 0;
-            }
-
-            // Add oversized file as solo chunk
-            chunks.push(Chunk {
-                content: file_content,
-                file_count: 1,
-                estimated_tokens: file_tokens,
-            });
+            tracing::warn!(
+                "Skipping file {} ({} tokens): exceeds chunk limit of {} tokens",
+                file.path.display(),
+                file_tokens,
+                max_tokens
+            );
             continue;
         }
 
