@@ -21,7 +21,8 @@ pub enum ReviewUpdateKind {
     /// A single prompt has completed (but review may continue with more prompts).
     PromptComplete,
     /// The entire review has completed (all prompts done).
-    ReviewComplete,
+    /// Includes the review results for consistent SSE payload shape.
+    ReviewComplete { results: serde_json::Value },
 }
 
 /// Broadcast channel message for streaming review updates to connected clients.

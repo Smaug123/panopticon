@@ -21,9 +21,9 @@ pub fn format_for_llm(contents: &[FileContent]) -> String {
 /// Estimate token count using a rough heuristic.
 ///
 /// This uses the common approximation of ~4 characters per token for English text.
-/// For code, this tends to slightly overestimate, which is safer for context limits.
+/// Uses ceiling division to slightly overestimate, which is safer for context limits.
 pub fn estimate_tokens(text: &str) -> u32 {
-    (text.len() / 4) as u32
+    text.len().div_ceil(4) as u32
 }
 
 /// Split contents into chunks that fit within a token limit.

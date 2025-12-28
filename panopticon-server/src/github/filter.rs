@@ -36,24 +36,43 @@ impl Default for FileFilter {
             "**/flake.lock",
             "**/composer.lock",
             "**/Pipfile.lock",
-            // Generated directories
+            // Generated directories (patterns with and without trailing /**)
+            // Both forms are needed: `**/dir/**` matches files inside,
+            // `**/dir` matches the directory itself for early traversal pruning.
             "**/node_modules/**",
+            "**/node_modules",
             "**/target/**",
+            "**/target",
             "**/dist/**",
+            "**/dist",
             "**/build/**",
+            "**/build",
             "**/.git/**",
+            "**/.git",
             "**/__pycache__/**",
+            "**/__pycache__",
             "**/.venv/**",
+            "**/.venv",
             "**/venv/**",
+            "**/venv",
             "**/.tox/**",
+            "**/.tox",
             "**/.mypy_cache/**",
+            "**/.mypy_cache",
             "**/.pytest_cache/**",
+            "**/.pytest_cache",
             "**/coverage/**",
+            "**/coverage",
             "**/.next/**",
+            "**/.next",
             "**/.nuxt/**",
+            "**/.nuxt",
             "**/vendor/**",
+            "**/vendor",
             "**/deps/**",
+            "**/deps",
             "**/_build/**",
+            "**/_build",
             // Binary and media files
             "**/*.png",
             "**/*.jpg",
@@ -107,10 +126,13 @@ impl Default for FileFilter {
             "**/*.db",
             "**/*.sqlite",
             "**/*.sqlite3",
-            // IDE and editor files
+            // IDE and editor files (with and without trailing /**)
             "**/.idea/**",
+            "**/.idea",
             "**/.vscode/**",
+            "**/.vscode",
             "**/.vs/**",
+            "**/.vs",
             "**/*.swp",
             "**/*.swo",
             "**/*~",
@@ -204,6 +226,24 @@ mod tests {
         assert!(!filter.should_include(&PathBuf::from("node_modules/foo/index.js"), 100));
         assert!(!filter.should_include(&PathBuf::from("target/debug/main"), 100));
         assert!(!filter.should_include(&PathBuf::from(".git/objects/abc"), 100));
+    }
+
+    #[test]
+    fn excludes_bare_directory_names() {
+        // Patterns must match bare directory names (without trailing components)
+        // to allow early traversal pruning and avoid reading huge directories.
+        let filter = FileFilter::default();
+
+        // Root level
+        assert!(!filter.should_include(&PathBuf::from("node_modules"), 0));
+        assert!(!filter.should_include(&PathBuf::from("target"), 0));
+        assert!(!filter.should_include(&PathBuf::from("dist"), 0));
+        assert!(!filter.should_include(&PathBuf::from("build"), 0));
+
+        // Nested
+        assert!(!filter.should_include(&PathBuf::from("foo/node_modules"), 0));
+        assert!(!filter.should_include(&PathBuf::from("packages/app/node_modules"), 0));
+        assert!(!filter.should_include(&PathBuf::from("crates/core/target"), 0));
     }
 
     #[test]

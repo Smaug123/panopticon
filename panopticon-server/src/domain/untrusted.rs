@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
 ///
 /// - Cannot be interpolated into strings via Display or ToString
 /// - Must explicitly call `sanitize_html()` or `as_raw()` to extract content
-/// - The `as_raw()` method is marked unsafe to discourage casual use
+/// - The `as_raw()` method requires explicit opt-in to access raw content
 /// - Serializes as a regular string for storage/API responses
 ///
 /// # Example

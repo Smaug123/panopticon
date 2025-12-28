@@ -92,12 +92,12 @@ impl ReviewCleanupGuard {
         self.should_cleanup = false;
     }
 
-    /// Helper to broadcast ReviewComplete event.
-    fn broadcast_complete(&self) {
+    /// Helper to broadcast ReviewComplete event with results.
+    fn broadcast_complete(&self, results: serde_json::Value) {
         let _ = self.review_updates.send(ReviewUpdate {
             review_id: self.review_id,
             prompt_name: String::new(),
-            kind: ReviewUpdateKind::ReviewComplete,
+            kind: ReviewUpdateKind::ReviewComplete { results },
         });
     }
 }
@@ -150,10 +150,15 @@ impl Drop for ReviewCleanupGuard {
                 }
 
                 // Broadcast ReviewComplete after DB update
+                // Fetch results to include in the broadcast for consistent SSE payload
+                let results = match reviews::get_by_id(&db, review_id).await {
+                    Ok(Some(review)) => serde_json::to_value(&review.results).unwrap_or_default(),
+                    _ => serde_json::Value::Array(vec![]),
+                };
                 let _ = review_updates.send(ReviewUpdate {
                     review_id,
                     prompt_name: String::new(),
-                    kind: ReviewUpdateKind::ReviewComplete,
+                    kind: ReviewUpdateKind::ReviewComplete { results },
                 });
             });
         }
@@ -552,8 +557,14 @@ impl JobRunner {
             repos::update_last_checked(&state.db, repo_id).await.ok();
             reviews::mark_failed(&state.db, review.id, "Some prompts failed").await?;
             // Broadcast AFTER DB update to prevent race condition where UI refreshes
-            // and sees stale in_progress status
-            cleanup_guard.broadcast_complete();
+            // and sees stale in_progress status. Fetch results for consistent SSE payload.
+            let results = reviews::get_by_id(&state.db, review.id)
+                .await
+                .ok()
+                .flatten()
+                .map(|r| serde_json::to_value(&r.results).unwrap_or_default())
+                .unwrap_or_else(|| serde_json::Value::Array(vec![]));
+            cleanup_guard.broadcast_complete(results);
             // Disarm the guard since we've handled the error ourselves
             cleanup_guard.disarm();
             // Return an error so the job is marked as failed and can be retried.
@@ -577,8 +588,15 @@ impl JobRunner {
             reviews::mark_completed(&state.db, review.id, duration.as_secs() as u32).await,
         )?;
 
-        // Broadcast AFTER DB update to prevent race condition
-        cleanup_guard.broadcast_complete();
+        // Broadcast AFTER DB update to prevent race condition.
+        // Fetch results for consistent SSE payload.
+        let results = reviews::get_by_id(&state.db, review.id)
+            .await
+            .ok()
+            .flatten()
+            .map(|r| serde_json::to_value(&r.results).unwrap_or_default())
+            .unwrap_or_else(|| serde_json::Value::Array(vec![]));
+        cleanup_guard.broadcast_complete(results);
         // Disarm the guard - we completed successfully
         cleanup_guard.disarm();
 

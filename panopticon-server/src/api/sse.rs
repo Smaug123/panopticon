@@ -82,8 +82,9 @@ pub async fn review_stream(
                         "type": "prompt_complete",
                         "prompt_name": update.prompt_name,
                     }),
-                    ReviewUpdateKind::ReviewComplete => serde_json::json!({
+                    ReviewUpdateKind::ReviewComplete { results } => serde_json::json!({
                         "type": "complete",
+                        "results": results,
                     }),
                 };
                 Some(Ok::<_, Infallible>(Event::default().data(data.to_string())))
