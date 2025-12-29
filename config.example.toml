@@ -1,0 +1,36 @@
+# Panopticon Configuration Example
+# Copy this to config.toml and fill in your values
+#
+# Environment variables override file config. Use double underscore as separator:
+#   PANOPTICON__LLM__PROVIDER__API_KEY=sk-...
+#   PANOPTICON__AUTH__API_KEY=your-secret
+#   PANOPTICON__SERVER__PORT=8080
+
+[server]
+host = "127.0.0.1"
+port = 3000
+
+[database]
+path = "./panopticon.db"
+
+[llm.provider]
+type = "open_ai"
+api_key = "sk-..."  # Or set PANOPTICON__LLM__PROVIDER__API_KEY env var
+model = "gpt-5.2-2025-12-11"
+# base_url = "https://api.openai.com/v1"  # Optional, for API-compatible providers
+reasoning_effort = "high"  # Options: "low", "medium", "high"
+# context_limit_tokens = 1000000  # Optional, defaults to 1M. Set lower for smaller-context models.
+
+[github]
+repos_dir = "./repos"
+
+[auth]
+api_key = "your-secret-api-key"  # Or set PANOPTICON__AUTH__API_KEY env var
+
+[scheduler]
+poll_interval_secs = 60
+review_interval_hours = 24
+# job_timeout_minutes = 30    # Jobs running longer than this are reclaimed
+# max_concurrent_jobs = 3     # Max parallel jobs (conservative given 5 DB connections)
+# git_timeout_secs = 300      # 5 minutes for git clone/fetch operations
+# llm_timeout_secs = 600      # 10 minutes for LLM API requests

@@ -1,0 +1,81 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Panopticon</title>
+    <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+    <header>
+        <h1>Panopticon</h1>
+        <p class="subtitle">Continuous Code Review</p>
+    </header>
+
+    <main>
+        <!-- Repos List Section -->
+        <section id="repos-section">
+            <div class="section-header">
+                <h2>Repositories</h2>
+                <button id="add-repo-btn" class="btn btn-primary">Add Repository</button>
+            </div>
+            <div id="repos-list" class="card-list">
+                <!-- Populated by JS -->
+            </div>
+        </section>
+
+        <!-- Repo Detail Section -->
+        <section id="repo-detail-section" class="hidden">
+            <button id="back-btn" class="btn btn-secondary">&larr; Back</button>
+            <div id="repo-header">
+                <!-- Repo name, URL, status -->
+            </div>
+
+            <div class="tabs">
+                <button class="tab active" data-tab="prompts">Prompts</button>
+                <button class="tab" data-tab="reviews">Review History</button>
+            </div>
+
+            <div id="prompts-panel" class="tab-panel">
+                <div class="section-header">
+                    <h3>Custom Prompts</h3>
+                    <button id="add-prompt-btn" class="btn btn-secondary">Add Prompt</button>
+                </div>
+                <div id="prompts-list">
+                    <!-- Populated by JS -->
+                </div>
+            </div>
+
+            <div id="reviews-panel" class="tab-panel hidden">
+                <div class="section-header">
+                    <h3>Review History</h3>
+                    <button id="trigger-review-btn" class="btn btn-primary">Trigger Review</button>
+                </div>
+                <div id="reviews-list">
+                    <!-- Populated by JS -->
+                </div>
+            </div>
+        </section>
+
+        <!-- Review Detail Section -->
+        <section id="review-detail-section" class="hidden">
+            <button id="review-back-btn" class="btn btn-secondary">&larr; Back</button>
+            <div id="review-header">
+                <!-- Review metadata -->
+            </div>
+            <div id="review-content">
+                <!-- Streaming output or completed results -->
+            </div>
+        </section>
+    </main>
+
+    <!-- Modal Overlay -->
+    <div id="modal-overlay" class="hidden">
+        <div id="modal-content">
+            <!-- Dynamic modal content -->
+        </div>
+    </div>
+
+    <script src="/static/app.js"></script>
+</body>
+</html>
