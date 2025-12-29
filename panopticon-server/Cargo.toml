@@ -1,0 +1,58 @@
+[package]
+name = "panopticon-server"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+# Web framework
+axum = { version = "0.7", features = ["macros"] }
+tower = "0.5"
+tower-http = { version = "0.6", features = ["fs", "cors"] }
+tokio = { version = "1", features = ["full"] }
+
+# Database
+sqlx = { version = "0.8", default-features = false, features = ["runtime-tokio", "sqlite"] }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Configuration
+config = "0.14"
+toml = "0.8"
+
+# HTTP client (for LLM)
+reqwest = { version = "0.12", features = ["json", "stream"] }
+
+# Async utilities
+futures = "0.3"
+async-stream = "0.3"
+tokio-stream = { version = "0.1", features = ["sync"] }
+
+# Date/time
+chrono = { version = "0.4", features = ["serde"] }
+
+# Error handling
+thiserror = "2"
+anyhow = "1"
+
+# Random number generation
+rand = "0.8"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# URL parsing
+url = "2"
+
+# Glob patterns
+glob = "0.3"
+
+# Static file embedding
+rust-embed = "8"
+mime_guess = "2"
+
+[dev-dependencies]
+proptest = "1"
+tempfile = "3"
