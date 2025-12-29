@@ -10,7 +10,7 @@ async fn main() -> anyhow::Result<()> {
         )
         .init();
 
-    let app = Router::new().fallback(any(|| async { () }));
+    let app = Router::new().fallback(any(|| async {}));
 
     let addr = "127.0.0.1:3000";
     tracing::info!("Starting server on {}", addr);
